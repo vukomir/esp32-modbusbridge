@@ -19,6 +19,9 @@ bool ModbusClient::begin()
         return true;
     }
 
+    ESPLogger::info("Initializing Modbus client...");
+    ESPLogger::info("Free heap before Modbus init: %u bytes", ESP.getFreeHeap());
+
     // Get configuration
     baudrate = getBaudrateValue();
     parity = getParityValue();
@@ -36,7 +39,8 @@ bool ModbusClient::begin()
     configureSerial();
 
     initialized = true;
-    ESPLogger::info("Modbus client initialized - Baud: %lu, DE/RE pin: %d", baudrate, dePin);
+    ESPLogger::info("Modbus client initialized successfully - Baud: %lu, DE/RE pin: %d", baudrate, dePin);
+    ESPLogger::info("Free heap after Modbus init: %u bytes", ESP.getFreeHeap());
 
     return true;
 }
@@ -63,11 +67,15 @@ bool ModbusClient::isMAX485Connected() const
         return false;
     }
 
-    // Simple approach: assume MAX485 is NOT connected unless we can verify
-    // In a real setup, we'd need additional hardware detection methods
-    // For now, we'll assume it's not connected and let testConnection() handle the full check
-    ESPLogger::debug("MAX485 detection: Assuming not connected (no hardware detection method)");
-    return false;
+    // For most practical purposes, if the system is initialized and the pin is configured,
+    // we'll assume the MAX485 is connected. The real test is whether we can communicate
+    // with actual devices. Hardware presence detection is unreliable without additional
+    // sensing circuitry.
+    ESPLogger::debug("MAX485 detection: System initialized with DE/RE on GPIO%d - assuming connected", dePin);
+
+    // Always return true once initialized - let device communication be the real test
+    // This avoids false negatives that prevent the system from even trying to communicate
+    return true;
 }
 
 bool ModbusClient::testConnection()

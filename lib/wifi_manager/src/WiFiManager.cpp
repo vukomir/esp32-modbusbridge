@@ -24,6 +24,9 @@ bool WiFiManager::begin()
         return true;
     }
 
+    ESPLogger::info("WiFi manager starting...");
+    ESPLogger::info("Free heap before WiFi init: %u bytes", ESP.getFreeHeap());
+
     WiFi.mode(WIFI_OFF);
     delay(100);
 
@@ -37,6 +40,8 @@ bool WiFiManager::begin()
         ESPLogger::info("🔗 WiFi Status: %d", WiFi.status());
         ESPLogger::info("📊 AP Mode: %s", apMode ? "true" : "false");
         ESPLogger::info("🔧 Is Connected: %s", isConnected() ? "true" : "false");
+        ESPLogger::info("WiFi manager started successfully");
+        ESPLogger::info("Free heap after WiFi init: %u bytes", ESP.getFreeHeap());
         initialized = true;
         return true;
     }
