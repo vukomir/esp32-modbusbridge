@@ -44,9 +44,20 @@ jobs:
         run: |
           pio pkg install
 
+      - name: Extract and export version information
+        run: |
+          echo "FIRMWARE_VERSION=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+          echo "GIT_HASH=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)" >> $GITHUB_ENV
+
       - name: Build Production Environment
         run: |
           pio run -e prod
+
+      - name: Package firmware
+        run: |
+          mkdir -p dist
+          cp .pio/build/prod/firmware.bin
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
