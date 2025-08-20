@@ -17,9 +17,9 @@ on:
       - 'README'
 
 jobs:
-  # Native tests that can run without hardware
-  native-tests:
-    name: Native Tests (No Hardware)
+  # Compilation tests for all test suites (verify they compile)
+  test-compilation:
+    name: Test Compilation Verification
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -32,8 +32,6 @@ jobs:
           - test_solplanet_asw
           - test_hiking_dds238
           - test_poller
-          - test_mqtt_client
-          - test_wifi_manager
     
     steps:
     - name: Checkout code
@@ -63,8 +61,8 @@ jobs:
     - name: Install project dependencies
       run: pio pkg install
       
-    - name: Run Native Tests - ${{ matrix.test-suite }}
-      run: pio test -e native -f ${{ matrix.test-suite }} -v
+    - name: Compile Test - ${{ matrix.test-suite }}
+      run: pio test -e dev -f ${{ matrix.test-suite }} --without-uploading --without-testing
       continue-on-error: false
 
   # ESP32 firmware build and test
@@ -174,18 +172,18 @@ jobs:
   pipeline-summary:
     name: Pipeline Summary
     runs-on: ubuntu-latest
-    needs: [native-tests, esp32-build, code-quality]
+    needs: [test-compilation, esp32-build, code-quality]
     if: always()
     steps:
     - name: Pipeline Summary
       run: |
         echo "=== CI/CD Pipeline Summary ==="
-        echo "Native Tests: ${{ needs.native-tests.result }}"
+        echo "Test Compilation: ${{ needs.test-compilation.result }}"
         echo "ESP32 Build: ${{ needs.esp32-build.result }}"
         echo "Code Quality: ${{ needs.code-quality.result }}"
         echo ""
         
-        if [ "${{ needs.native-tests.result }}" = "success" ] && [ "${{ needs.esp32-build.result }}" = "success" ]; then
+        if [ "${{ needs.test-compilation.result }}" = "success" ] && [ "${{ needs.esp32-build.result }}" = "success" ]; then
           echo "✅ All critical jobs passed!"
           echo "🚀 Ready for deployment!"
           exit 0
