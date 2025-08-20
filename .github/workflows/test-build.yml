@@ -49,13 +49,13 @@ jobs:
         run: |
           pio pkg install
 
-      - name: Build prod Environment
+      - name: Build dev Environment
         run: |
-          pio run -e prod
+          pio run -e dev
 
       - name: Upload Test Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: firmware-test
-          path: .pio/build/prod/firmware.bin
+          path: .pio/build/dev/firmware.bin
           retention-days: 7 
