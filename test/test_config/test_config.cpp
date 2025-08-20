@@ -89,6 +89,7 @@ void test_config_persistence()
 
     // Create new config instance and load
     Config *newConfig = new Config();
+    newConfig->begin(); // Initialize before loading
     bool loadResult = newConfig->load();
     TEST_ASSERT_TRUE(loadResult);
 
@@ -138,16 +139,20 @@ void test_config_validation()
 // Test factory reset
 void test_config_factory_reset()
 {
-    // Set some values
-    testConfig->setString("reset_string", "value");
-    testConfig->setInt("reset_int", 789);
+    // Set some values that will be overridden by factory reset
+    testConfig->setString("wifi_ssid", "test_network");
+    testConfig->setInt("rtu_addr", 999);
 
     // Perform factory reset
     testConfig->factoryReset();
 
-    // Verify values are gone (should return defaults)
-    TEST_ASSERT_EQUAL_STRING("", testConfig->getString("reset_string").c_str());
-    TEST_ASSERT_EQUAL_INT(0, testConfig->getInt("reset_int"));
+    // Verify values are reset to defaults (not empty, but default values)
+    TEST_ASSERT_EQUAL_STRING("", testConfig->getString("wifi_ssid").c_str()); // wifi_ssid defaults to empty
+    TEST_ASSERT_EQUAL_INT(1, testConfig->getInt("rtu_addr"));                 // rtu_addr defaults to 1
+
+    // Test that non-default keys return their method defaults
+    TEST_ASSERT_EQUAL_STRING("", testConfig->getString("nonexistent_key").c_str());
+    TEST_ASSERT_EQUAL_INT(0, testConfig->getInt("nonexistent_key"));
 }
 
 void setup()

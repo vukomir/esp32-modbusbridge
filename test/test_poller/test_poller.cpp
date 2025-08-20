@@ -135,10 +135,10 @@ void test_device_model_configuration()
     bool result = validPoller.begin();
     TEST_ASSERT_TRUE(result || !result); // May fail without device, but should not crash
 
-        // Test with invalid device model
+    // Test with invalid device model
     testConfig->setString("device_model", "invalid_model");
     Poller invalidPoller(*testConfig, *mqttClient, *modbusClient);
-    
+
     result = invalidPoller.begin();
     // May succeed or fail depending on factory implementation - just test it doesn't crash
     TEST_ASSERT_TRUE(result || !result);
