@@ -55,6 +55,8 @@ run_test "test_esplogger"
 # Communication Library Tests  
 echo -e "${BLUE}🔧 Communication Libraries${NC}"
 run_test "test_modbus_client"
+run_test "test_mqtt_client"
+run_test "test_wifi_manager"
 
 # Device Library Tests
 echo -e "${BLUE}🔧 Device Libraries${NC}"
