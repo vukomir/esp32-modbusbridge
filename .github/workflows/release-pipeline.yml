@@ -54,11 +54,16 @@ jobs:
         run: |
           pio run -e prod
 
+      - name: Package firmware
+        run: |
+          mkdir -p dist
+          cp .pio/build/prod/firmware.bin dist/firmware.bin
+
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: firmware
-          path: .pio/build/prod/firmware.bin
+          path: dist/*.bin
           retention-days: 1
 
   release:
@@ -69,13 +74,14 @@ jobs:
       - name: Download Build Artifacts
         uses: actions/download-artifact@v4
         with:
-          path: .pio/build/prod/firmware.bin
+          name: firmware
+          path: dist
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            .pio/build/prod/firmware.bin
+            dist/*.bin
           draft: false
           prerelease: false
           generate_release_notes: true
