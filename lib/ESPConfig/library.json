@@ -1,0 +1,32 @@
+{
+    "name": "ESPConfig",
+    "version": "1.0.0",
+    "description": "Centralized configuration management for ESP devices with JSON persistence",
+    "keywords": [
+        "esp8266",
+        "esp32",
+        "config",
+        "json",
+        "littlefs"
+    ],
+    "authors": [
+        {
+            "name": "Vucomir Ianculov",
+            "email": "vucomir@ianculov.ro"
+        }
+    ],
+    "license": "MIT",
+    "dependencies": [
+        {
+            "name": "ArduinoJson",
+            "version": "^7.1.0"
+        }
+    ],
+    "frameworks": [
+        "arduino"
+    ],
+    "platforms": [
+        "espressif8266",
+        "espressif32"
+    ]
+}
