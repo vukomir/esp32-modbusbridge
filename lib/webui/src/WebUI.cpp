@@ -39,6 +39,9 @@ bool WebUI::begin(uint16_t port)
         return true;
     }
 
+    ESPLogger::info("Web UI starting on port %d...", port);
+    ESPLogger::info("Free heap before WebUI init: %u bytes", ESP.getFreeHeap());
+
     // Initialize log buffer
     logStartTime = millis();
     ESPLogger::setLogCallback(logCallback);
@@ -124,7 +127,8 @@ bool WebUI::begin(uint16_t port)
 
     server.begin();
     running = true;
-    ESPLogger::info("Web UI started on port %d", port);
+    ESPLogger::info("Web UI started successfully on port %d", port);
+    ESPLogger::info("Free heap after WebUI init: %u bytes", ESP.getFreeHeap());
     return true;
 }
 

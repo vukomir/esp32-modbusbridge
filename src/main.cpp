@@ -63,48 +63,22 @@ void setup()
     ESPLogger::info("Log level set to: %s", logLevel.c_str());
     ESPLogger::info("Free heap after config: %u bytes", ESP.getFreeHeap());
 
-    // WiFi Manager
+    // Initialize components
     wifiManager.begin();
-    ESPLogger::info("WiFi manager started");
-    ESPLogger::info("Free heap after WiFi: %u bytes", ESP.getFreeHeap());
-
-    // Web UI
     webUI.begin(80);
-    ESPLogger::info("Web UI started on port 80");
-    ESPLogger::info("Free heap after WebUI: %u bytes", ESP.getFreeHeap());
 
     // ESP32 has plenty of memory - enable all components
     ESPLogger::info("ESP32 detected - enabling all components");
 
-    // Re-enable all components now that device is stable
-    ESPLogger::info("Re-enabling all components with optimized memory usage...");
-
-    // Initialize MQTT
-    ESPLogger::info("Initializing MQTT client...");
-    ESPLogger::info("Free heap before MQTT init: %u bytes", ESP.getFreeHeap());
     mqttClient.begin();
-    ESPLogger::info("MQTT initialized successfully");
-    ESPLogger::info("Free heap after MQTT init: %u bytes", ESP.getFreeHeap());
-
-    // Initialize Modbus (now using Serial2)
-    ESPLogger::info("Initializing Modbus client...");
-    ESPLogger::info("Free heap before Modbus init: %u bytes", ESP.getFreeHeap());
     modbusClient.begin();
-    ESPLogger::info("Modbus initialized successfully");
-    ESPLogger::info("Free heap after Modbus init: %u bytes", ESP.getFreeHeap());
-
-    // Initialize Poller
-    ESPLogger::info("Initializing Poller...");
-    ESPLogger::info("Free heap before Poller init: %u bytes", ESP.getFreeHeap());
     poller.begin();
-    ESPLogger::info("Poller initialized successfully");
-    ESPLogger::info("Free heap after Poller init: %u bytes", ESP.getFreeHeap());
 
     ESPLogger::info("");
     ESPLogger::info("All components enabled!");
-    ESPLogger::info("- ESP32 D1 (GPIO5) → MAX485 DE/RE");
-    ESPLogger::info("- ESP32 D2 (GPIO4) → MAX485 RO");
-    ESPLogger::info("- ESP32 D3 (GPIO0) → MAX485 DI");
+    ESPLogger::info("- ESP32 D2 (GPIO4) → MAX485 DE/RE");
+    ESPLogger::info("- ESP32 D16 (GPIO16) → MAX485 RO");
+    ESPLogger::info("- ESP32 D17 (GPIO17) → MAX485 DI");
     ESPLogger::info("- Connect MAX485 A/B to device RS485 terminals");
 
     ESPLogger::info("=== System Ready ===");

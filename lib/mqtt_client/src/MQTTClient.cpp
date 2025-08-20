@@ -15,6 +15,9 @@ MQTTClient::~MQTTClient()
 
 bool MQTTClient::begin()
 {
+    ESPLogger::info("Initializing MQTT client...");
+    ESPLogger::info("Free heap before MQTT init: %u bytes", ESP.getFreeHeap());
+
     if (!validateMQTTConfig())
     {
         ESPLogger::error("Invalid MQTT configuration");
@@ -33,7 +36,8 @@ bool MQTTClient::begin()
 
     initialized = true;
 
-    ESPLogger::info("MQTT client initialized - Broker: %s:%d", broker.c_str(), port);
+    ESPLogger::info("MQTT client initialized successfully - Broker: %s:%d", broker.c_str(), port);
+    ESPLogger::info("Free heap after MQTT init: %u bytes", ESP.getFreeHeap());
 
     return true;
 }
