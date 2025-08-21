@@ -125,19 +125,20 @@ bool ModbusClient::testDeviceCommunication(uint8_t slaveId)
         return false;
     }
 
-    ESPLogger::info("Testing device communication with slave ID %d", slaveId);
-
+        ESPLogger::info("Testing device communication with slave ID %d", slaveId);
+    
     // Add detailed debugging for the communication test
-    ESPLogger::debug("Building test frame: slave=%d, function=0x03, address=0x0000, count=1", slaveId);
+    ESPLogger::debug("Building test frame: slave=%d, function=0x03, address=0x000C, count=1", slaveId);
 
-    // Try to read a single holding register (address 0)
-    // This is a safe, minimal request that most Modbus devices support
+    // Try to read a single holding register (address 0x000C - voltage register)
+    // This register is known to work based on successful multi-register reads
     uint16_t testData;
-    bool result = readHoldingRegisters(slaveId, 0, 1, &testData);
+    bool result = readHoldingRegisters(slaveId, 0x000C, 1, &testData);
 
     if (result)
     {
-        ESPLogger::info("Device communication successful - slave %d responded", slaveId);
+        ESPLogger::info("Device communication successful - slave %d responded with voltage: %.1f V", 
+                       slaveId, testData * 0.1f);
     }
     else
     {

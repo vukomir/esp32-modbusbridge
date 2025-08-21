@@ -14,13 +14,13 @@ bool DDS238Simulator::begin()
     ESPLogger::info("Initializing DDS238 Energy Meter Simulator, slave address: %d", slaveAddr);
     ESPLogger::info("Expected register map: 0x0000-0x0011 (Total: 18 registers)");
     ESPLogger::info("Device configuration: 9600 baud, 8N1, Function Code 03");
-    
+
     if (!modbus.isInitialized())
     {
         ESPLogger::error("Modbus client not initialized");
         return false;
     }
-    
+
     return true;
 }
 
@@ -28,23 +28,23 @@ bool DDS238Simulator::readBasic(std::vector<TelemetryPoint> &out)
 {
     out.clear();
     bool success = true;
-    
+
     ESPLogger::info("Reading DDS238 simulator basic telemetry...");
-    
+
     // Read energy registers first (optional - some simulators may not implement these)
     if (!readEnergyRegisters(out))
     {
         ESPLogger::debug("Energy registers not available from DDS238 simulator (optional)");
         // Don't mark as failure - energy registers are optional for simulators
     }
-    
+
     // Read instantaneous measurement registers (required)
     if (!readInstantaneousRegisters(out))
     {
         ESPLogger::warn("Failed to read instantaneous registers from DDS238 simulator");
         success = false;
     }
-    
+
     ESPLogger::info("Read %d telemetry points from DDS238 simulator", out.size());
     return success && !out.empty();
 }
@@ -59,7 +59,7 @@ bool DDS238Simulator::readStorage(std::vector<TelemetryPoint> &out)
 bool DDS238Simulator::readEnergyRegisters(std::vector<TelemetryPoint> &out)
 {
     ESPLogger::debug("Reading energy registers from DDS238 simulator...");
-    
+
     // Read Total Energy (0x0000-0x0001): 32-bit value, 0.01 kWh resolution
     uint16_t totalEnergyRegs[2];
     if (modbus.readHoldingRegisters(slaveAddr, 0x0000, 2, totalEnergyRegs))
@@ -77,7 +77,7 @@ bool DDS238Simulator::readEnergyRegisters(std::vector<TelemetryPoint> &out)
         ESPLogger::debug("Total energy registers 0x0000-0x0001 not available (optional for simulators)");
         // Don't return false - energy registers are optional
     }
-    
+
     // Read Export Energy (0x0008-0x0009): 32-bit value, 0.01 kWh resolution
     uint16_t exportEnergyRegs[2];
     if (modbus.readHoldingRegisters(slaveAddr, 0x0008, 2, exportEnergyRegs))
@@ -94,7 +94,7 @@ bool DDS238Simulator::readEnergyRegisters(std::vector<TelemetryPoint> &out)
     {
         ESPLogger::debug("Export energy registers 0x0008-0x0009 not available (optional)");
     }
-    
+
     // Read Import Energy (0x000A-0x000B): 32-bit value, 0.01 kWh resolution
     uint16_t importEnergyRegs[2];
     if (modbus.readHoldingRegisters(slaveAddr, 0x000A, 2, importEnergyRegs))
@@ -111,14 +111,14 @@ bool DDS238Simulator::readEnergyRegisters(std::vector<TelemetryPoint> &out)
     {
         ESPLogger::debug("Import energy registers 0x000A-0x000B not available (optional)");
     }
-    
+
     return true;
 }
 
 bool DDS238Simulator::readInstantaneousRegisters(std::vector<TelemetryPoint> &out)
 {
     ESPLogger::debug("Reading instantaneous registers from DDS238 simulator...");
-    
+
     // Read instantaneous values (0x000C-0x0011): 6 registers
     uint16_t instantaneous[6];
     if (modbus.readHoldingRegisters(slaveAddr, 0x000C, 6, instantaneous))
@@ -131,7 +131,7 @@ bool DDS238Simulator::readInstantaneousRegisters(std::vector<TelemetryPoint> &ou
             out.push_back({"voltage", "V", String(voltage, 1)});
             ESPLogger::debug("Voltage: %.1f V", voltage);
         }
-        
+
         // Current (0x000D): uint16, 0.01 A resolution
         uint16_t currentRaw = instantaneous[1];
         if (isValidRegisterValue(currentRaw))
@@ -140,7 +140,7 @@ bool DDS238Simulator::readInstantaneousRegisters(std::vector<TelemetryPoint> &ou
             out.push_back({"current", "A", String(current, 2)});
             ESPLogger::debug("Current: %.2f A", current);
         }
-        
+
         // Active Power (0x000E): int16, 1 W resolution
         int16_t activePower = (int16_t)instantaneous[2];
         if (activePower != (int16_t)0x8000) // Check for invalid signed value
@@ -148,7 +148,7 @@ bool DDS238Simulator::readInstantaneousRegisters(std::vector<TelemetryPoint> &ou
             out.push_back({"active_power", "W", String(activePower)});
             ESPLogger::debug("Active Power: %d W", activePower);
         }
-        
+
         // Reactive Power (0x000F): int16, 1 VAR resolution
         int16_t reactivePower = (int16_t)instantaneous[3];
         if (reactivePower != (int16_t)0x8000)
@@ -156,7 +156,7 @@ bool DDS238Simulator::readInstantaneousRegisters(std::vector<TelemetryPoint> &ou
             out.push_back({"reactive_power", "VAR", String(reactivePower)});
             ESPLogger::debug("Reactive Power: %d VAR", reactivePower);
         }
-        
+
         // Power Factor (0x0010): uint16, 0.001 resolution
         uint16_t powerFactorRaw = instantaneous[4];
         if (isValidRegisterValue(powerFactorRaw))
@@ -165,7 +165,7 @@ bool DDS238Simulator::readInstantaneousRegisters(std::vector<TelemetryPoint> &ou
             out.push_back({"power_factor", "", String(powerFactor, 3)});
             ESPLogger::debug("Power Factor: %.3f", powerFactor);
         }
-        
+
         // Frequency (0x0011): uint16, 0.01 Hz resolution
         uint16_t frequencyRaw = instantaneous[5];
         if (isValidRegisterValue(frequencyRaw))
@@ -174,7 +174,7 @@ bool DDS238Simulator::readInstantaneousRegisters(std::vector<TelemetryPoint> &ou
             out.push_back({"frequency", "Hz", String(frequency, 2)});
             ESPLogger::debug("Frequency: %.2f Hz", frequency);
         }
-        
+
         ESPLogger::info("Successfully read instantaneous values from DDS238 simulator");
         return true;
     }
