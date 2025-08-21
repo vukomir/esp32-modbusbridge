@@ -3,7 +3,7 @@
 
 ModbusClient::ModbusClient(Config &config)
     : config(config), serial(&Serial2), dePin(-1), initialized(false),
-      baudrate(9600), parity(SERIAL_8N1), stopBits(1), dataBits(8), responseTimeout(1000)
+      baudrate(9600), parity(SERIAL_8N1), stopBits(1), dataBits(8), responseTimeout(2000)
 {
 }
 
@@ -28,6 +28,14 @@ bool ModbusClient::begin()
     stopBits = config.getInt("stop_bits", 1);
     dataBits = getDataBitsValue();
     dePin = config.getInt("rs485_de_re_pin", 4);
+
+    // Calculate adaptive response timeout based on baud rate
+    // Formula: Base timeout + transmission time for max response (256 bytes) + safety margin
+    uint32_t bitsPerByte = 1 + dataBits + (parity != 'N' ? 1 : 0) + stopBits;
+    uint32_t maxResponseTime = (256 * bitsPerByte * 1000) / baudrate; // Max response transmission time
+    responseTimeout = maxResponseTime + 500;                          // Add 500ms safety margin
+
+    ESPLogger::debug("Calculated response timeout: %lums (based on %lu baud)", responseTimeout, baudrate);
 
     // Configure DE/RE pin
     if (dePin >= 0)
@@ -231,7 +239,7 @@ bool ModbusClient::sendFrame(const uint8_t *frame, size_t length)
         return false;
     }
 
-    // Clear any pending data
+    // Clear any pending data and ensure silent interval before transmission
     int clearedBytes = 0;
     while (serial->available())
     {
@@ -241,6 +249,12 @@ bool ModbusClient::sendFrame(const uint8_t *frame, size_t length)
     if (clearedBytes > 0)
     {
         ESPLogger::debug("Cleared %d bytes from serial buffer before sending", clearedBytes);
+
+        // Per Modbus spec: Ensure 3.5 character times of silence after clearing buffer
+        uint32_t bitsPerByte = 1 + dataBits + (parity != 'N' ? 1 : 0) + stopBits;
+        uint32_t preSilentInterval = (3.5 * bitsPerByte * 1000) / baudrate;
+        ESPLogger::debug("Pre-transmission silent interval: %lums", preSilentInterval);
+        delay(preSilentInterval);
     }
 
     // Log the frame being sent for debugging
@@ -263,12 +277,17 @@ bool ModbusClient::sendFrame(const uint8_t *frame, size_t length)
     // Calculate transmission time and add margin
     // Total bits per byte = start bit + data bits + parity bit (if any) + stop bits
     uint32_t bitsPerByte = 1 + dataBits + (parity != 'N' ? 1 : 0) + stopBits;
-    uint32_t transmissionTime = (length * bitsPerByte * 1000) / baudrate + 10; // Increased margin
+    uint32_t transmissionTime = (length * bitsPerByte * 1000) / baudrate;
     ESPLogger::debug("Transmission time: %lums (%lu bits/byte)", transmissionTime, bitsPerByte);
     delay(transmissionTime);
 
+    // Per Modbus spec: Add silent interval (3.5 character times minimum)
+    uint32_t silentInterval = (3.5 * bitsPerByte * 1000) / baudrate;
+    ESPLogger::debug("Adding silent interval: %lums", silentInterval);
+    delay(silentInterval);
+
     setReceiveMode();
-    delayMicroseconds(100); // Additional delay for DE/RE switching
+    delayMicroseconds(500); // Longer delay for proper DE/RE switching per spec
 
     ESPLogger::debug("Frame sent: %zu/%zu bytes", written, length);
     return written == length;
@@ -303,10 +322,10 @@ bool ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, size_t &actua
 
             ESPLogger::debug("Received byte %zu: 0x%02X", actualLength, byte);
         }
-        else if (actualLength > 0 && millis() - lastByteTime > 20) // Increased inter-frame timeout
+        else if (actualLength > 0 && millis() - lastByteTime > 50) // Extended timeout for reliable frame completion
         {
-            // Inter-frame timeout - frame complete
-            ESPLogger::debug("Inter-frame timeout reached, frame complete");
+            // Inter-frame timeout - frame complete (extended for MAX485 switching delays)
+            ESPLogger::debug("Inter-frame timeout reached (50ms), frame complete");
             break;
         }
 
@@ -338,8 +357,8 @@ bool ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, size_t &actua
         }
         else if (actualLength == 2)
         {
-            ESPLogger::error("Received 2 bytes (0x%02X 0x%02X) - likely electrical noise or baud rate mismatch", 
-                           buffer[0], buffer[1]);
+            ESPLogger::error("Received 2 bytes (0x%02X 0x%02X) - likely electrical noise or baud rate mismatch",
+                             buffer[0], buffer[1]);
             ESPLogger::error("Try: 1) Swap A/B wiring, 2) Add termination resistor, 3) Try different baud rate");
         }
         else
