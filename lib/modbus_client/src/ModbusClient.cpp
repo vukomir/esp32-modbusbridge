@@ -336,6 +336,16 @@ bool ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, size_t &actua
         {
             ESPLogger::error("No response received - check device address, baud rate, and wiring");
         }
+        else if (actualLength == 2)
+        {
+            ESPLogger::error("Received 2 bytes (0x%02X 0x%02X) - likely electrical noise or baud rate mismatch", 
+                           buffer[0], buffer[1]);
+            ESPLogger::error("Try: 1) Swap A/B wiring, 2) Add termination resistor, 3) Try different baud rate");
+        }
+        else
+        {
+            ESPLogger::error("Partial response (%zu bytes) - possible timing or electrical issues", actualLength);
+        }
         return false;
     }
 
