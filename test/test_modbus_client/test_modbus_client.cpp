@@ -140,6 +140,56 @@ void test_parity_configuration()
     noneClient.end();
 }
 
+// Test data bits configuration
+void test_data_bits_configuration()
+{
+    // Test 7 data bits
+    testConfig->setInt("data_bits", 7);
+    ModbusClient sevenBitClient(*testConfig);
+    TEST_ASSERT_TRUE(sevenBitClient.begin());
+    sevenBitClient.end();
+
+    // Test 8 data bits (default)
+    testConfig->setInt("data_bits", 8);
+    ModbusClient eightBitClient(*testConfig);
+    TEST_ASSERT_TRUE(eightBitClient.begin());
+    eightBitClient.end();
+
+    // Test invalid data bits (should default to 8)
+    testConfig->setInt("data_bits", 6);
+    ModbusClient invalidBitsClient(*testConfig);
+    TEST_ASSERT_TRUE(invalidBitsClient.begin()); // Should still work with default
+    invalidBitsClient.end();
+}
+
+// Test complete serial configuration combinations
+void test_serial_configuration_combinations()
+{
+    // Test 7E1 configuration
+    testConfig->setInt("data_bits", 7);
+    testConfig->setString("parity", "E");
+    testConfig->setInt("stop_bits", 1);
+    ModbusClient config7E1(*testConfig);
+    TEST_ASSERT_TRUE(config7E1.begin());
+    config7E1.end();
+
+    // Test 8N2 configuration
+    testConfig->setInt("data_bits", 8);
+    testConfig->setString("parity", "N");
+    testConfig->setInt("stop_bits", 2);
+    ModbusClient config8N2(*testConfig);
+    TEST_ASSERT_TRUE(config8N2.begin());
+    config8N2.end();
+
+    // Test 7O1 configuration
+    testConfig->setInt("data_bits", 7);
+    testConfig->setString("parity", "O");
+    testConfig->setInt("stop_bits", 1);
+    ModbusClient config7O1(*testConfig);
+    TEST_ASSERT_TRUE(config7O1.begin());
+    config7O1.end();
+}
+
 // Test DE/RE pin configuration
 void test_de_re_pin_configuration()
 {
@@ -225,6 +275,8 @@ void setup()
     RUN_TEST(test_scaling_functions);
     RUN_TEST(test_configuration_validation);
     RUN_TEST(test_parity_configuration);
+    RUN_TEST(test_data_bits_configuration);
+    RUN_TEST(test_serial_configuration_combinations);
     RUN_TEST(test_de_re_pin_configuration);
     RUN_TEST(test_max485_detection);
     RUN_TEST(test_connection_testing);

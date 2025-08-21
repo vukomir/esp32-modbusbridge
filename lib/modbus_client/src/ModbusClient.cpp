@@ -3,7 +3,7 @@
 
 ModbusClient::ModbusClient(Config &config)
     : config(config), serial(&Serial2), dePin(-1), initialized(false),
-      baudrate(9600), parity(SERIAL_8N1), stopBits(1), responseTimeout(500)
+      baudrate(9600), parity(SERIAL_8N1), stopBits(1), dataBits(8), responseTimeout(500)
 {
 }
 
@@ -26,6 +26,7 @@ bool ModbusClient::begin()
     baudrate = getBaudrateValue();
     parity = getParityValue();
     stopBits = config.getInt("stop_bits", 1);
+    dataBits = getDataBitsValue();
     dePin = config.getInt("rs485_de_re_pin", 4);
 
     // Configure DE/RE pin
@@ -39,7 +40,9 @@ bool ModbusClient::begin()
     configureSerial();
 
     initialized = true;
-    ESPLogger::info("Modbus client initialized successfully - Baud: %lu, DE/RE pin: %d", baudrate, dePin);
+    ESPLogger::info("Modbus client initialized successfully");
+    ESPLogger::info("Serial config: %lu baud, %d%c%d, DE/RE pin: GPIO%d", 
+                   baudrate, dataBits, (char)parity, stopBits, dePin);
     ESPLogger::info("Free heap after Modbus init: %u bytes", ESP.getFreeHeap());
 
     return true;
@@ -237,7 +240,9 @@ bool ModbusClient::sendFrame(const uint8_t *frame, size_t length)
     serial->flush(); // Wait for transmission to complete
 
     // Calculate transmission time and add margin
-    uint32_t transmissionTime = (length * 11 * 1000) / baudrate + 5; // 11 bits per byte + 5ms margin
+    // Total bits per byte = start bit + data bits + parity bit (if any) + stop bits
+    uint32_t bitsPerByte = 1 + dataBits + (parity != 'N' ? 1 : 0) + stopBits;
+    uint32_t transmissionTime = (length * bitsPerByte * 1000) / baudrate + 5; // + 5ms margin
     delay(transmissionTime);
 
     setReceiveMode();
@@ -411,26 +416,48 @@ void ModbusClient::configureSerial()
 {
     SerialConfig serialConfig;
 
-    // Build serial configuration
-    switch (parity)
+    // Build serial configuration based on data bits, parity, and stop bits
+    if (dataBits == 7)
     {
-    case 'E':
-    case 'e':
-        serialConfig = (stopBits == 2) ? SERIAL_8E2 : SERIAL_8E1;
-        break;
-    case 'O':
-    case 'o':
-        serialConfig = (stopBits == 2) ? SERIAL_8O2 : SERIAL_8O1;
-        break;
-    default: // 'N' or anything else
-        serialConfig = (stopBits == 2) ? SERIAL_8N2 : SERIAL_8N1;
-        break;
+        // 7 data bits configurations
+        switch (parity)
+        {
+        case 'E':
+        case 'e':
+            serialConfig = (stopBits == 2) ? SERIAL_7E2 : SERIAL_7E1;
+            break;
+        case 'O':
+        case 'o':
+            serialConfig = (stopBits == 2) ? SERIAL_7O2 : SERIAL_7O1;
+            break;
+        default: // 'N' or anything else
+            serialConfig = (stopBits == 2) ? SERIAL_7N2 : SERIAL_7N1;
+            break;
+        }
+    }
+    else // 8 data bits (default)
+    {
+        // 8 data bits configurations
+        switch (parity)
+        {
+        case 'E':
+        case 'e':
+            serialConfig = (stopBits == 2) ? SERIAL_8E2 : SERIAL_8E1;
+            break;
+        case 'O':
+        case 'o':
+            serialConfig = (stopBits == 2) ? SERIAL_8O2 : SERIAL_8O1;
+            break;
+        default: // 'N' or anything else
+            serialConfig = (stopBits == 2) ? SERIAL_8N2 : SERIAL_8N1;
+            break;
+        }
     }
 
     // Configure Serial2 with specific pins for ESP32 (avoid conflict with Serial)
     // RX = GPIO16, TX = GPIO17 (default Serial2 pins on ESP32)
     serial->begin(baudrate, serialConfig, 16, 17);
-    ESPLogger::info("Serial2 configured: %lu baud, RX=GPIO16, TX=GPIO17", baudrate);
+    ESPLogger::debug("Serial2 hardware: RX=GPIO16, TX=GPIO17");
 
     // Wait for serial to be ready
     delay(50); // Reduced delay
@@ -465,4 +492,20 @@ int ModbusClient::getParityValue() const
     if (parityStr == "O")
         return 'O';
     return 'N'; // Default to None
+}
+
+int ModbusClient::getDataBitsValue() const
+{
+    int configDataBits = config.getInt("data_bits", 8);
+
+    // Validate against supported data bit values
+    switch (configDataBits)
+    {
+    case 7:
+    case 8:
+        return configDataBits;
+    default:
+        ESPLogger::error("Invalid data bits %d, using 8", configDataBits);
+        return 8;
+    }
 }

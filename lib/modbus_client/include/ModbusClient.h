@@ -41,6 +41,7 @@ private:
     uint32_t baudrate;
     int parity;
     int stopBits;
+    int dataBits;
     uint32_t responseTimeout;
 
     // Frame handling
@@ -61,4 +62,5 @@ private:
     void configureSerial();
     uint32_t getBaudrateValue() const;
     int getParityValue() const;
+    int getDataBitsValue() const;
 };
