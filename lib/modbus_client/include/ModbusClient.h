@@ -37,6 +37,7 @@ private:
     Config &config;
     HardwareSerial *serial;
     int dePin;
+    int ledPin;
     bool initialized;
     uint32_t baudrate;
     int parity;
@@ -53,6 +54,11 @@ private:
     // DE/RE control
     void setTransmitMode();
     void setReceiveMode();
+
+    // LED activity indicator
+    void ledOn();
+    void ledOff();
+    void blinkLED(int duration = 100);
 
     // Frame building
     size_t buildReadFrame(uint8_t slaveId, uint8_t function, uint16_t startAddr, uint16_t count, uint8_t *frame);

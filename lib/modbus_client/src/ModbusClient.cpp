@@ -2,7 +2,7 @@
 #include <ESPLogger.h>
 
 ModbusClient::ModbusClient(Config &config)
-    : config(config), serial(&Serial2), dePin(-1), initialized(false),
+    : config(config), serial(&Serial2), dePin(-1), ledPin(2), initialized(false),
       baudrate(9600), parity(SERIAL_8N1), stopBits(1), dataBits(8), responseTimeout(2000)
 {
 }
@@ -42,6 +42,14 @@ bool ModbusClient::begin()
     {
         pinMode(dePin, OUTPUT);
         setReceiveMode(); // Start in receive mode
+    }
+
+    // Configure LED pin for activity indication
+    if (ledPin >= 0)
+    {
+        pinMode(ledPin, OUTPUT);
+        ledOff(); // Start with LED off
+        ESPLogger::debug("LED activity indicator configured on GPIO%d", ledPin);
     }
 
     // Configure and start serial
@@ -127,9 +135,6 @@ bool ModbusClient::testDeviceCommunication(uint8_t slaveId)
 
     ESPLogger::info("Testing device communication with slave ID %d", slaveId);
 
-    // Add detailed debugging for the communication test
-    ESPLogger::debug("Building test frame: slave=%d, function=0x03, address=0x000C, count=3", slaveId);
-
     // Use multi-register read for device test (more reliable and efficient)
     // Read 3 registers: voltage, current, and power (0x000C-0x000E)
     uint16_t testData[3];
@@ -158,24 +163,35 @@ bool ModbusClient::readHoldingRegisters(uint8_t slaveId, uint16_t startAddr, uin
         return false;
     }
 
+    // Turn on LED to indicate Modbus activity
+    ledOn();
+
     uint8_t frame[8];
     size_t frameLength = buildReadFrame(slaveId, 0x03, startAddr, count, frame);
 
-    if (!sendFrame(frame, frameLength))
+    bool success = false;
+    if (sendFrame(frame, frameLength))
+    {
+        uint8_t response[256];
+        size_t responseLength;
+        if (receiveFrame(response, sizeof(response), responseLength))
+        {
+            success = parseReadResponse(response, responseLength, count, data);
+        }
+        else
+        {
+            ESPLogger::error("Failed to receive holding registers response");
+        }
+    }
+    else
     {
         ESPLogger::error("Failed to send holding registers read frame");
-        return false;
     }
 
-    uint8_t response[256];
-    size_t responseLength;
-    if (!receiveFrame(response, sizeof(response), responseLength))
-    {
-        ESPLogger::error("Failed to receive holding registers response");
-        return false;
-    }
+    // Turn off LED after operation completes
+    ledOff();
 
-    return parseReadResponse(response, responseLength, count, data);
+    return success;
 }
 
 bool ModbusClient::readInputRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t count, uint16_t *data)
@@ -185,24 +201,35 @@ bool ModbusClient::readInputRegisters(uint8_t slaveId, uint16_t startAddr, uint1
         return false;
     }
 
+    // Turn on LED to indicate Modbus activity
+    ledOn();
+
     uint8_t frame[8];
     size_t frameLength = buildReadFrame(slaveId, 0x04, startAddr, count, frame);
 
-    if (!sendFrame(frame, frameLength))
+    bool success = false;
+    if (sendFrame(frame, frameLength))
+    {
+        uint8_t response[256];
+        size_t responseLength;
+        if (receiveFrame(response, sizeof(response), responseLength))
+        {
+            success = parseReadResponse(response, responseLength, count, data);
+        }
+        else
+        {
+            ESPLogger::error("Failed to receive input registers response");
+        }
+    }
+    else
     {
         ESPLogger::error("Failed to send input registers read frame");
-        return false;
     }
 
-    uint8_t response[256];
-    size_t responseLength;
-    if (!receiveFrame(response, sizeof(response), responseLength))
-    {
-        ESPLogger::error("Failed to receive input registers response");
-        return false;
-    }
+    // Turn off LED after operation completes
+    ledOff();
 
-    return parseReadResponse(response, responseLength, count, data);
+    return success;
 }
 
 uint32_t ModbusClient::combineRegisters(uint16_t high, uint16_t low) const
@@ -261,16 +288,8 @@ bool ModbusClient::sendFrame(const uint8_t *frame, size_t length)
         delay(preSilentInterval);
     }
 
-    // Log the frame being sent for debugging
-    ESPLogger::debug("Sending Modbus frame (%zu bytes):", length);
-    String frameHex = "";
-    for (size_t i = 0; i < length; i++)
-    {
-        if (i > 0)
-            frameHex += " ";
-        frameHex += String(frame[i], HEX);
-    }
-    ESPLogger::debug("Frame: %s", frameHex.c_str());
+    // Log frame summary (reduced verbosity)
+    ESPLogger::debug("Sending Modbus frame (%zu bytes)", length);
 
     setTransmitMode();
     delayMicroseconds(100); // Additional delay for DE/RE switching
@@ -282,12 +301,10 @@ bool ModbusClient::sendFrame(const uint8_t *frame, size_t length)
     // Total bits per byte = start bit + data bits + parity bit (if any) + stop bits
     uint32_t bitsPerByte = 1 + dataBits + (parity != 'N' ? 1 : 0) + stopBits;
     uint32_t transmissionTime = (length * bitsPerByte * 1000) / baudrate;
-    ESPLogger::debug("Transmission time: %lums (%lu bits/byte)", transmissionTime, bitsPerByte);
     delay(transmissionTime);
 
     // Per Modbus spec: Add silent interval (3.5 character times minimum)
     uint32_t silentInterval = (3.5 * bitsPerByte * 1000) / baudrate;
-    ESPLogger::debug("Adding silent interval: %lums", silentInterval);
     delay(silentInterval);
 
     setReceiveMode();
@@ -308,8 +325,6 @@ bool ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, size_t &actua
     unsigned long startTime = millis();
     unsigned long lastByteTime = startTime;
 
-    ESPLogger::debug("Waiting for response (timeout: %lums)...", responseTimeout);
-
     while (millis() - startTime < responseTimeout)
     {
         if (serial->available())
@@ -323,8 +338,6 @@ bool ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, size_t &actua
             uint8_t byte = serial->read();
             buffer[actualLength++] = byte;
             lastByteTime = millis();
-
-            ESPLogger::debug("Received byte %zu: 0x%02X", actualLength, byte);
         }
         else if (actualLength > 0 && millis() - lastByteTime > 50) // Extended timeout for reliable frame completion
         {
@@ -339,17 +352,10 @@ bool ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, size_t &actua
     unsigned long totalTime = millis() - startTime;
     ESPLogger::debug("Response received: %zu bytes in %lums", actualLength, totalTime);
 
-    // Log received frame for debugging
+    // Log response summary (reduced verbosity)
     if (actualLength > 0)
     {
-        String responseHex = "";
-        for (size_t i = 0; i < actualLength; i++)
-        {
-            if (i > 0)
-                responseHex += " ";
-            responseHex += String(buffer[i], HEX);
-        }
-        ESPLogger::debug("Response frame: %s", responseHex.c_str());
+        ESPLogger::debug("Response frame received (%zu bytes)", actualLength);
     }
 
     if (actualLength < 5)
@@ -424,7 +430,6 @@ void ModbusClient::setTransmitMode()
     {
         digitalWrite(dePin, HIGH);
         delayMicroseconds(200); // Increased delay for MAX485 switching
-        ESPLogger::debug("DE/RE pin set to TRANSMIT mode");
     }
 }
 
@@ -434,7 +439,6 @@ void ModbusClient::setReceiveMode()
     {
         digitalWrite(dePin, LOW);
         delayMicroseconds(200); // Increased delay for MAX485 switching
-        ESPLogger::debug("DE/RE pin set to RECEIVE mode");
     }
 }
 
@@ -450,9 +454,6 @@ size_t ModbusClient::buildReadFrame(uint8_t slaveId, uint8_t function, uint16_t 
     uint16_t crc = calculateCRC(frame, 6);
     frame[6] = crc & 0xFF;
     frame[7] = (crc >> 8) & 0xFF;
-
-    ESPLogger::debug("Built frame: slave=%d, func=0x%02X, addr=0x%04X, count=%d, crc=0x%04X",
-                     slaveId, function, startAddr, count, crc);
 
     return 8;
 }
@@ -597,4 +598,27 @@ int ModbusClient::getDataBitsValue() const
         ESPLogger::error("Invalid data bits %d, using 8", configDataBits);
         return 8;
     }
+}
+
+void ModbusClient::ledOn()
+{
+    if (ledPin >= 0)
+    {
+        digitalWrite(ledPin, HIGH);
+    }
+}
+
+void ModbusClient::ledOff()
+{
+    if (ledPin >= 0)
+    {
+        digitalWrite(ledPin, LOW);
+    }
+}
+
+void ModbusClient::blinkLED(int duration)
+{
+    ledOn();
+    delay(duration);
+    ledOff();
 }
