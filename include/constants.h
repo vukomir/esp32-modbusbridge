@@ -40,6 +40,7 @@
 #define DEFAULT_DEVICE_MODEL "solplanet_asw_gen"
 #define SOLPLANET_ASW_MODEL "solplanet_asw_gen"
 #define HIKING_DDS238_MODEL "hiking_dds238"
+#define DDS238_SIMULATOR_MODEL "dds238_simulator"
 
 // Device List Structure
 struct DeviceInfo
@@ -52,7 +53,8 @@ struct DeviceInfo
 // Supported Devices List
 static const DeviceInfo SUPPORTED_DEVICES[] = {
     {SOLPLANET_ASW_MODEL, "SolPlanet ASW GEN", "inverter"},
-    {HIKING_DDS238_MODEL, "Hiking DDS238 Smart Meter", "meter"}};
+    {HIKING_DDS238_MODEL, "Hiking DDS238 Smart Meter", "meter"},
+    {DDS238_SIMULATOR_MODEL, "DDS238 Energy Meter Simulator", "meter"}};
 
 #define SUPPORTED_DEVICES_COUNT (sizeof(SUPPORTED_DEVICES) / sizeof(DeviceInfo))
 

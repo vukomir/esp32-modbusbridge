@@ -47,6 +47,7 @@ void Config::setDefaults()
     config["rtu_addr"] = 1;
     config["baudrate"] = 9600;
     config["parity"] = "N";
+    config["data_bits"] = 8;
     config["stop_bits"] = 1;
     config["rs485_de_re_pin"] = 4;
 
@@ -158,11 +159,28 @@ bool Config::validate()
         return false;
     }
 
+    // Validate data bits
+    int dataBits = getInt("data_bits", 8);
+    if (dataBits != 7 && dataBits != 8)
+    {
+        ESPLogger::error("Invalid data bits, must be 7 or 8");
+        return false;
+    }
+
+    // Validate stop bits
+    int stopBits = getInt("stop_bits", 1);
+    if (stopBits != 1 && stopBits != 2)
+    {
+        ESPLogger::error("Invalid stop bits, must be 1 or 2");
+        return false;
+    }
+
     // Validate numeric ranges
     int baudrate = getInt("baudrate");
-    if (baudrate != 9600 && baudrate != 19200 && baudrate != 38400)
+    if (baudrate != 9600 && baudrate != 19200 && baudrate != 38400 && 
+        baudrate != 57600 && baudrate != 115200)
     {
-        ESPLogger::error("Invalid baudrate, must be 9600, 19200, or 38400");
+        ESPLogger::error("Invalid baudrate, must be 9600, 19200, 38400, 57600, or 115200");
         return false;
     }
 

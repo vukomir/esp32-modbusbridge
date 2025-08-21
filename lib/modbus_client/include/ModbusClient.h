@@ -37,10 +37,12 @@ private:
     Config &config;
     HardwareSerial *serial;
     int dePin;
+    int ledPin;
     bool initialized;
     uint32_t baudrate;
     int parity;
     int stopBits;
+    int dataBits;
     uint32_t responseTimeout;
 
     // Frame handling
@@ -53,6 +55,11 @@ private:
     void setTransmitMode();
     void setReceiveMode();
 
+    // LED activity indicator
+    void ledOn();
+    void ledOff();
+    void blinkLED(int duration = 100);
+
     // Frame building
     size_t buildReadFrame(uint8_t slaveId, uint8_t function, uint16_t startAddr, uint16_t count, uint8_t *frame);
     bool parseReadResponse(const uint8_t *response, size_t length, uint16_t expectedCount, uint16_t *data);
@@ -61,4 +68,5 @@ private:
     void configureSerial();
     uint32_t getBaudrateValue() const;
     int getParityValue() const;
+    int getDataBitsValue() const;
 };

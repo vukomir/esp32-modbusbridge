@@ -2,8 +2,8 @@
 #include <ESPLogger.h>
 
 ModbusClient::ModbusClient(Config &config)
-    : config(config), serial(&Serial2), dePin(-1), initialized(false),
-      baudrate(9600), parity(SERIAL_8N1), stopBits(1), responseTimeout(500)
+    : config(config), serial(&Serial2), dePin(-1), ledPin(2), initialized(false),
+      baudrate(9600), parity(SERIAL_8N1), stopBits(1), dataBits(8), responseTimeout(2000)
 {
 }
 
@@ -26,7 +26,16 @@ bool ModbusClient::begin()
     baudrate = getBaudrateValue();
     parity = getParityValue();
     stopBits = config.getInt("stop_bits", 1);
+    dataBits = getDataBitsValue();
     dePin = config.getInt("rs485_de_re_pin", 4);
+
+    // Calculate adaptive response timeout based on baud rate
+    // Formula: Base timeout + transmission time for max response (256 bytes) + safety margin
+    uint32_t bitsPerByte = 1 + dataBits + (parity != 'N' ? 1 : 0) + stopBits;
+    uint32_t maxResponseTime = (256 * bitsPerByte * 1000) / baudrate; // Max response transmission time
+    responseTimeout = maxResponseTime + 500;                          // Add 500ms safety margin
+
+    ESPLogger::debug("Calculated response timeout: %lums (based on %lu baud)", responseTimeout, baudrate);
 
     // Configure DE/RE pin
     if (dePin >= 0)
@@ -35,11 +44,21 @@ bool ModbusClient::begin()
         setReceiveMode(); // Start in receive mode
     }
 
+    // Configure LED pin for activity indication
+    if (ledPin >= 0)
+    {
+        pinMode(ledPin, OUTPUT);
+        ledOff(); // Start with LED off
+        ESPLogger::debug("LED activity indicator configured on GPIO%d", ledPin);
+    }
+
     // Configure and start serial
     configureSerial();
 
     initialized = true;
-    ESPLogger::info("Modbus client initialized successfully - Baud: %lu, DE/RE pin: %d", baudrate, dePin);
+    ESPLogger::info("Modbus client initialized successfully");
+    ESPLogger::info("Serial config: %lu baud, %d%c%d, DE/RE pin: GPIO%d",
+                    baudrate, dataBits, (char)parity, stopBits, dePin);
     ESPLogger::info("Free heap after Modbus init: %u bytes", ESP.getFreeHeap());
 
     return true;
@@ -116,14 +135,18 @@ bool ModbusClient::testDeviceCommunication(uint8_t slaveId)
 
     ESPLogger::info("Testing device communication with slave ID %d", slaveId);
 
-    // Try to read a single holding register (address 0)
-    // This is a safe, minimal request that most Modbus devices support
-    uint16_t testData;
-    bool result = readHoldingRegisters(slaveId, 0, 1, &testData);
+    // Use multi-register read for device test (more reliable and efficient)
+    // Read 3 registers: voltage, current, and power (0x000C-0x000E)
+    uint16_t testData[3];
+    bool result = readHoldingRegisters(slaveId, 0x000C, 3, testData);
 
     if (result)
     {
-        ESPLogger::info("Device communication successful - slave %d responded", slaveId);
+        float voltage = testData[0] * 0.1f;
+        float current = testData[1] * 0.01f;
+        int16_t power = (int16_t)testData[2];
+        ESPLogger::info("Device communication successful - slave %d responded:", slaveId);
+        ESPLogger::info("  Voltage: %.1f V, Current: %.2f A, Power: %d W", voltage, current, power);
     }
     else
     {
@@ -140,24 +163,35 @@ bool ModbusClient::readHoldingRegisters(uint8_t slaveId, uint16_t startAddr, uin
         return false;
     }
 
+    // Turn on LED to indicate Modbus activity
+    ledOn();
+
     uint8_t frame[8];
     size_t frameLength = buildReadFrame(slaveId, 0x03, startAddr, count, frame);
 
-    if (!sendFrame(frame, frameLength))
+    bool success = false;
+    if (sendFrame(frame, frameLength))
+    {
+        uint8_t response[256];
+        size_t responseLength;
+        if (receiveFrame(response, sizeof(response), responseLength))
+        {
+            success = parseReadResponse(response, responseLength, count, data);
+        }
+        else
+        {
+            ESPLogger::error("Failed to receive holding registers response");
+        }
+    }
+    else
     {
         ESPLogger::error("Failed to send holding registers read frame");
-        return false;
     }
 
-    uint8_t response[256];
-    size_t responseLength;
-    if (!receiveFrame(response, sizeof(response), responseLength))
-    {
-        ESPLogger::error("Failed to receive holding registers response");
-        return false;
-    }
+    // Turn off LED after operation completes
+    ledOff();
 
-    return parseReadResponse(response, responseLength, count, data);
+    return success;
 }
 
 bool ModbusClient::readInputRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t count, uint16_t *data)
@@ -167,24 +201,35 @@ bool ModbusClient::readInputRegisters(uint8_t slaveId, uint16_t startAddr, uint1
         return false;
     }
 
+    // Turn on LED to indicate Modbus activity
+    ledOn();
+
     uint8_t frame[8];
     size_t frameLength = buildReadFrame(slaveId, 0x04, startAddr, count, frame);
 
-    if (!sendFrame(frame, frameLength))
+    bool success = false;
+    if (sendFrame(frame, frameLength))
+    {
+        uint8_t response[256];
+        size_t responseLength;
+        if (receiveFrame(response, sizeof(response), responseLength))
+        {
+            success = parseReadResponse(response, responseLength, count, data);
+        }
+        else
+        {
+            ESPLogger::error("Failed to receive input registers response");
+        }
+    }
+    else
     {
         ESPLogger::error("Failed to send input registers read frame");
-        return false;
     }
 
-    uint8_t response[256];
-    size_t responseLength;
-    if (!receiveFrame(response, sizeof(response), responseLength))
-    {
-        ESPLogger::error("Failed to receive input registers response");
-        return false;
-    }
+    // Turn off LED after operation completes
+    ledOff();
 
-    return parseReadResponse(response, responseLength, count, data);
+    return success;
 }
 
 uint32_t ModbusClient::combineRegisters(uint16_t high, uint16_t low) const
@@ -225,23 +270,47 @@ bool ModbusClient::sendFrame(const uint8_t *frame, size_t length)
         return false;
     }
 
-    // Clear any pending data
+    // Clear any pending data and ensure silent interval before transmission
+    int clearedBytes = 0;
     while (serial->available())
     {
         serial->read();
+        clearedBytes++;
+    }
+    if (clearedBytes > 0)
+    {
+        ESPLogger::debug("Cleared %d bytes from serial buffer before sending", clearedBytes);
+
+        // Per Modbus spec: Ensure 3.5 character times of silence after clearing buffer
+        uint32_t bitsPerByte = 1 + dataBits + (parity != 'N' ? 1 : 0) + stopBits;
+        uint32_t preSilentInterval = (3.5 * bitsPerByte * 1000) / baudrate;
+        ESPLogger::debug("Pre-transmission silent interval: %lums", preSilentInterval);
+        delay(preSilentInterval);
     }
 
+    // Log frame summary (reduced verbosity)
+    ESPLogger::debug("Sending Modbus frame (%zu bytes)", length);
+
     setTransmitMode();
+    delayMicroseconds(100); // Additional delay for DE/RE switching
 
     size_t written = serial->write(frame, length);
     serial->flush(); // Wait for transmission to complete
 
     // Calculate transmission time and add margin
-    uint32_t transmissionTime = (length * 11 * 1000) / baudrate + 5; // 11 bits per byte + 5ms margin
+    // Total bits per byte = start bit + data bits + parity bit (if any) + stop bits
+    uint32_t bitsPerByte = 1 + dataBits + (parity != 'N' ? 1 : 0) + stopBits;
+    uint32_t transmissionTime = (length * bitsPerByte * 1000) / baudrate;
     delay(transmissionTime);
 
-    setReceiveMode();
+    // Per Modbus spec: Add silent interval (3.5 character times minimum)
+    uint32_t silentInterval = (3.5 * bitsPerByte * 1000) / baudrate;
+    delay(silentInterval);
 
+    setReceiveMode();
+    delayMicroseconds(500); // Longer delay for proper DE/RE switching per spec
+
+    ESPLogger::debug("Frame sent: %zu/%zu bytes", written, length);
     return written == length;
 }
 
@@ -266,21 +335,46 @@ bool ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, size_t &actua
                 return false;
             }
 
-            buffer[actualLength++] = serial->read();
+            uint8_t byte = serial->read();
+            buffer[actualLength++] = byte;
             lastByteTime = millis();
         }
-        else if (actualLength > 0 && millis() - lastByteTime > 10)
+        else if (actualLength > 0 && millis() - lastByteTime > 50) // Extended timeout for reliable frame completion
         {
-            // Inter-frame timeout - frame complete
+            // Inter-frame timeout - frame complete (extended for MAX485 switching delays)
+            ESPLogger::debug("Inter-frame timeout reached (50ms), frame complete");
             break;
         }
 
         yield(); // Allow other tasks to run
     }
 
+    unsigned long totalTime = millis() - startTime;
+    ESPLogger::debug("Response received: %zu bytes in %lums", actualLength, totalTime);
+
+    // Log response summary (reduced verbosity)
+    if (actualLength > 0)
+    {
+        ESPLogger::debug("Response frame received (%zu bytes)", actualLength);
+    }
+
     if (actualLength < 5)
     { // Minimum frame: slave + function + data + 2 CRC bytes
-        ESPLogger::error("Response too short: %zu bytes", actualLength);
+        ESPLogger::error("Response too short: %zu bytes (minimum 5 required)", actualLength);
+        if (actualLength == 0)
+        {
+            ESPLogger::error("No response received - check device address, baud rate, and wiring");
+        }
+        else if (actualLength == 2)
+        {
+            ESPLogger::error("Received 2 bytes (0x%02X 0x%02X) - likely electrical noise or baud rate mismatch",
+                             buffer[0], buffer[1]);
+            ESPLogger::error("Try: 1) Swap A/B wiring, 2) Add termination resistor, 3) Try different baud rate");
+        }
+        else
+        {
+            ESPLogger::error("Partial response (%zu bytes) - possible timing or electrical issues", actualLength);
+        }
         return false;
     }
 
@@ -290,6 +384,7 @@ bool ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, size_t &actua
         return false;
     }
 
+    ESPLogger::debug("Frame received and validated successfully");
     return true;
 }
 
@@ -334,7 +429,7 @@ void ModbusClient::setTransmitMode()
     if (dePin >= 0)
     {
         digitalWrite(dePin, HIGH);
-        delayMicroseconds(50); // Small delay for switching
+        delayMicroseconds(200); // Increased delay for MAX485 switching
     }
 }
 
@@ -343,7 +438,7 @@ void ModbusClient::setReceiveMode()
     if (dePin >= 0)
     {
         digitalWrite(dePin, LOW);
-        delayMicroseconds(50); // Small delay for switching
+        delayMicroseconds(200); // Increased delay for MAX485 switching
     }
 }
 
@@ -411,26 +506,48 @@ void ModbusClient::configureSerial()
 {
     SerialConfig serialConfig;
 
-    // Build serial configuration
-    switch (parity)
+    // Build serial configuration based on data bits, parity, and stop bits
+    if (dataBits == 7)
     {
-    case 'E':
-    case 'e':
-        serialConfig = (stopBits == 2) ? SERIAL_8E2 : SERIAL_8E1;
-        break;
-    case 'O':
-    case 'o':
-        serialConfig = (stopBits == 2) ? SERIAL_8O2 : SERIAL_8O1;
-        break;
-    default: // 'N' or anything else
-        serialConfig = (stopBits == 2) ? SERIAL_8N2 : SERIAL_8N1;
-        break;
+        // 7 data bits configurations
+        switch (parity)
+        {
+        case 'E':
+        case 'e':
+            serialConfig = (stopBits == 2) ? SERIAL_7E2 : SERIAL_7E1;
+            break;
+        case 'O':
+        case 'o':
+            serialConfig = (stopBits == 2) ? SERIAL_7O2 : SERIAL_7O1;
+            break;
+        default: // 'N' or anything else
+            serialConfig = (stopBits == 2) ? SERIAL_7N2 : SERIAL_7N1;
+            break;
+        }
+    }
+    else // 8 data bits (default)
+    {
+        // 8 data bits configurations
+        switch (parity)
+        {
+        case 'E':
+        case 'e':
+            serialConfig = (stopBits == 2) ? SERIAL_8E2 : SERIAL_8E1;
+            break;
+        case 'O':
+        case 'o':
+            serialConfig = (stopBits == 2) ? SERIAL_8O2 : SERIAL_8O1;
+            break;
+        default: // 'N' or anything else
+            serialConfig = (stopBits == 2) ? SERIAL_8N2 : SERIAL_8N1;
+            break;
+        }
     }
 
     // Configure Serial2 with specific pins for ESP32 (avoid conflict with Serial)
     // RX = GPIO16, TX = GPIO17 (default Serial2 pins on ESP32)
     serial->begin(baudrate, serialConfig, 16, 17);
-    ESPLogger::info("Serial2 configured: %lu baud, RX=GPIO16, TX=GPIO17", baudrate);
+    ESPLogger::debug("Serial2 hardware: RX=GPIO16, TX=GPIO17");
 
     // Wait for serial to be ready
     delay(50); // Reduced delay
@@ -465,4 +582,43 @@ int ModbusClient::getParityValue() const
     if (parityStr == "O")
         return 'O';
     return 'N'; // Default to None
+}
+
+int ModbusClient::getDataBitsValue() const
+{
+    int configDataBits = config.getInt("data_bits", 8);
+
+    // Validate against supported data bit values
+    switch (configDataBits)
+    {
+    case 7:
+    case 8:
+        return configDataBits;
+    default:
+        ESPLogger::error("Invalid data bits %d, using 8", configDataBits);
+        return 8;
+    }
+}
+
+void ModbusClient::ledOn()
+{
+    if (ledPin >= 0)
+    {
+        digitalWrite(ledPin, HIGH);
+    }
+}
+
+void ModbusClient::ledOff()
+{
+    if (ledPin >= 0)
+    {
+        digitalWrite(ledPin, LOW);
+    }
+}
+
+void ModbusClient::blinkLED(int duration)
+{
+    ledOn();
+    delay(duration);
+    ledOff();
 }
