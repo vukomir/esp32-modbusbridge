@@ -1327,14 +1327,15 @@ void WebUI::cleanupDisconnectedClients()
     {
         if (wsClients[i].connected)
         {
-            // Check if client is still connected by checking last ping time
-            // Increased timeout to 10 minutes to avoid disconnecting active clients
-            if (millis() - wsClients[i].lastPing > 600000)
-            { // 10 minutes timeout (much more generous)
-                ESPLogger::debug("WebSocket client %u timed out after 10 minutes, removing", wsClients[i].id);
-                wsClients[i].connected = false;
-                wsClients[i].id = 255;
-                connectedClients--;
+            // Use a more conservative approach - only clean up session data, not disconnect clients
+            // The WStype_DISCONNECTED event handler will clean up properly disconnected clients
+            if (millis() - wsClients[i].lastPing > 3600000)
+            {
+                // Only reset session statistics after 1 hour of complete inactivity
+                // Don't disconnect the client, just reset our tracking data to prevent memory bloat
+                wsClients[i].lastPing = millis(); // Reset ping time to prevent repeated resets
+                wsClients[i].messageCount = 0;    // Reset message count
+                // Keep client connected, just clean up session stats silently
             }
         }
     }
