@@ -99,9 +99,11 @@ void Poller::poll()
         return;
     }
 
-    // Both MAX485 and inverter are responding
-    ESPLogger::info("✅ SolPlanet inverter CONNECTED and responding via RS485");
-    publishHardwareStatus("inverter", "connected", "SolPlanet inverter responding");
+    // Both MAX485 and device are responding
+    String deviceModel = config.getString("device_model", DEFAULT_DEVICE_MODEL);
+    String deviceType = InverterFactory::getDeviceType(deviceModel);
+    ESPLogger::info("✅ %s CONNECTED and responding via RS485", deviceModel.c_str());
+    publishHardwareStatus(deviceType, "connected", deviceModel + " responding");
 
     bool success = readAndPublishTelemetry();
     if (success)

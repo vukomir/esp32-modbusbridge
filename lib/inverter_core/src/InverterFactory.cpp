@@ -1,6 +1,7 @@
 #include "InverterFactory.h"
 #include "SolplanetASW.h"
 #include "HikingDDS238.h"
+#include "DDS238Simulator.h"
 #include "ModbusClient.h"
 #include "constants.h"
 #include <memory>
@@ -14,6 +15,10 @@ std::unique_ptr<InverterInterface> InverterFactory::create(const String &model, 
     else if (model == HIKING_DDS238_MODEL)
     {
         return std::unique_ptr<InverterInterface>(new HikingDDS238(modbus, config));
+    }
+    else if (model == DDS238_SIMULATOR_MODEL)
+    {
+        return std::unique_ptr<InverterInterface>(new DDS238Simulator(modbus, config));
     }
     return nullptr;
 }
