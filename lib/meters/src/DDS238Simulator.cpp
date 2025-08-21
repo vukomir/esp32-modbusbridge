@@ -31,14 +31,14 @@ bool DDS238Simulator::readBasic(std::vector<TelemetryPoint> &out)
     
     ESPLogger::info("Reading DDS238 simulator basic telemetry...");
     
-    // Read energy registers first (these are the core functionality)
+    // Read energy registers first (optional - some simulators may not implement these)
     if (!readEnergyRegisters(out))
     {
-        ESPLogger::warn("Failed to read energy registers from DDS238 simulator");
-        success = false;
+        ESPLogger::debug("Energy registers not available from DDS238 simulator (optional)");
+        // Don't mark as failure - energy registers are optional for simulators
     }
     
-    // Read instantaneous measurement registers
+    // Read instantaneous measurement registers (required)
     if (!readInstantaneousRegisters(out))
     {
         ESPLogger::warn("Failed to read instantaneous registers from DDS238 simulator");
@@ -74,8 +74,8 @@ bool DDS238Simulator::readEnergyRegisters(std::vector<TelemetryPoint> &out)
     }
     else
     {
-        ESPLogger::error("Failed to read total energy registers 0x0000-0x0001");
-        return false;
+        ESPLogger::debug("Total energy registers 0x0000-0x0001 not available (optional for simulators)");
+        // Don't return false - energy registers are optional
     }
     
     // Read Export Energy (0x0008-0x0009): 32-bit value, 0.01 kWh resolution
