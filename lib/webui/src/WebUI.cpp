@@ -139,8 +139,8 @@ void WebUI::handleClient()
         server.handleClient();
         wsServer.loop();
 
-        // Periodic cleanup of disconnected clients (every 30 seconds)
-        if (millis() - lastClientCleanup > 30000)
+        // Periodic cleanup of disconnected clients (every 5 minutes)
+        if (millis() - lastClientCleanup > 300000)
         {
             cleanupDisconnectedClients();
             lastClientCleanup = millis();
@@ -1328,9 +1328,10 @@ void WebUI::cleanupDisconnectedClients()
         if (wsClients[i].connected)
         {
             // Check if client is still connected by checking last ping time
-            if (millis() - wsClients[i].lastPing > 60000)
-            { // 60 seconds timeout
-                ESPLogger::warn("WebSocket client %u timed out, removing", wsClients[i].id);
+            // Increased timeout to 10 minutes to avoid disconnecting active clients
+            if (millis() - wsClients[i].lastPing > 600000)
+            { // 10 minutes timeout (much more generous)
+                ESPLogger::debug("WebSocket client %u timed out after 10 minutes, removing", wsClients[i].id);
                 wsClients[i].connected = false;
                 wsClients[i].id = 255;
                 connectedClients--;
