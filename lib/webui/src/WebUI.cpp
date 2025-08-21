@@ -199,7 +199,7 @@ void WebUI::handleSave()
             config.setString(name, value);
         }
         else if (name == "mqtt_port" || name == "rtu_addr" ||
-                 name == "baudrate" || name == "stop_bits" ||
+                 name == "baudrate" || name == "data_bits" || name == "stop_bits" ||
                  name == "rs485_de_re_pin" || name == "poll_interval_sec")
         {
             config.setInt(name, value.toInt());
@@ -759,14 +759,23 @@ String WebUI::generateConfigForm()
     html += selectInput("baudrate", String(config.getInt("baudrate")),
                         selectOption("9600", String(config.getInt("baudrate")), "9600") +
                             selectOption("19200", String(config.getInt("baudrate")), "19200") +
-                            selectOption("38400", String(config.getInt("baudrate")), "38400"),
+                            selectOption("38400", String(config.getInt("baudrate")), "38400") +
+                            selectOption("57600", String(config.getInt("baudrate")), "57600") +
+                            selectOption("115200", String(config.getInt("baudrate")), "115200"),
                         "Baud Rate");
+    html += selectInput("data_bits", String(config.getInt("data_bits")),
+                        selectOption("7", String(config.getInt("data_bits")), "7 bits") +
+                            selectOption("8", String(config.getInt("data_bits")), "8 bits"),
+                        "Data Bits");
     html += selectInput("parity", config.getString("parity"),
                         selectOption("N", config.getString("parity"), "None") +
                             selectOption("E", config.getString("parity"), "Even") +
                             selectOption("O", config.getString("parity"), "Odd"),
                         "Parity");
-    html += textInput("stop_bits", String(config.getInt("stop_bits")), "Stop Bits", "number");
+    html += selectInput("stop_bits", String(config.getInt("stop_bits")),
+                        selectOption("1", String(config.getInt("stop_bits")), "1 bit") +
+                            selectOption("2", String(config.getInt("stop_bits")), "2 bits"),
+                        "Stop Bits");
     html += textInput("rs485_de_re_pin", String(config.getInt("rs485_de_re_pin")), "DE/RE Pin", "number");
     html += "</fieldset>";
 

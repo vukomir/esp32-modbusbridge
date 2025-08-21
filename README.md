@@ -124,7 +124,7 @@ Once configured and connected to your WiFi:
 
 ### **Modbus Settings**
 - **Slave Address**: Device address (default: `1`)
-- **Baud Rate**: Communication speed (9600, 19200, 38400)
+- **Baud Rate**: Communication speed (9600, 19200, 38400, 57600, 115200, default: `9600`)
 - **Data Bits**: Number of data bits (7 or 8, default: `8`)
 - **Parity**: None, Even, or Odd (default: `N`)
 - **Stop Bits**: Number of stop bits (1 or 2, default: `1`)

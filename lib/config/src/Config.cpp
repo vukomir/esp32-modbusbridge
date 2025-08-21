@@ -177,9 +177,10 @@ bool Config::validate()
 
     // Validate numeric ranges
     int baudrate = getInt("baudrate");
-    if (baudrate != 9600 && baudrate != 19200 && baudrate != 38400)
+    if (baudrate != 9600 && baudrate != 19200 && baudrate != 38400 && 
+        baudrate != 57600 && baudrate != 115200)
     {
-        ESPLogger::error("Invalid baudrate, must be 9600, 19200, or 38400");
+        ESPLogger::error("Invalid baudrate, must be 9600, 19200, 38400, 57600, or 115200");
         return false;
     }
 

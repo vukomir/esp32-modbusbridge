@@ -41,8 +41,8 @@ bool ModbusClient::begin()
 
     initialized = true;
     ESPLogger::info("Modbus client initialized successfully");
-    ESPLogger::info("Serial config: %lu baud, %d%c%d, DE/RE pin: GPIO%d", 
-                   baudrate, dataBits, (char)parity, stopBits, dePin);
+    ESPLogger::info("Serial config: %lu baud, %d%c%d, DE/RE pin: GPIO%d",
+                    baudrate, dataBits, (char)parity, stopBits, dePin);
     ESPLogger::info("Free heap after Modbus init: %u bytes", ESP.getFreeHeap());
 
     return true;
