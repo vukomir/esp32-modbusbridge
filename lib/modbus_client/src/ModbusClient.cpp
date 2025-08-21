@@ -3,7 +3,7 @@
 
 ModbusClient::ModbusClient(Config &config)
     : config(config), serial(&Serial2), dePin(-1), initialized(false),
-      baudrate(9600), parity(SERIAL_8N1), stopBits(1), dataBits(8), responseTimeout(500)
+      baudrate(9600), parity(SERIAL_8N1), stopBits(1), dataBits(8), responseTimeout(1000)
 {
 }
 
@@ -119,6 +119,9 @@ bool ModbusClient::testDeviceCommunication(uint8_t slaveId)
 
     ESPLogger::info("Testing device communication with slave ID %d", slaveId);
 
+    // Add detailed debugging for the communication test
+    ESPLogger::debug("Building test frame: slave=%d, function=0x03, address=0x0000, count=1", slaveId);
+
     // Try to read a single holding register (address 0)
     // This is a safe, minimal request that most Modbus devices support
     uint16_t testData;
@@ -229,12 +232,30 @@ bool ModbusClient::sendFrame(const uint8_t *frame, size_t length)
     }
 
     // Clear any pending data
+    int clearedBytes = 0;
     while (serial->available())
     {
         serial->read();
+        clearedBytes++;
+    }
+    if (clearedBytes > 0)
+    {
+        ESPLogger::debug("Cleared %d bytes from serial buffer before sending", clearedBytes);
     }
 
+    // Log the frame being sent for debugging
+    ESPLogger::debug("Sending Modbus frame (%zu bytes):", length);
+    String frameHex = "";
+    for (size_t i = 0; i < length; i++)
+    {
+        if (i > 0)
+            frameHex += " ";
+        frameHex += String(frame[i], HEX);
+    }
+    ESPLogger::debug("Frame: %s", frameHex.c_str());
+
     setTransmitMode();
+    delayMicroseconds(100); // Additional delay for DE/RE switching
 
     size_t written = serial->write(frame, length);
     serial->flush(); // Wait for transmission to complete
@@ -242,11 +263,14 @@ bool ModbusClient::sendFrame(const uint8_t *frame, size_t length)
     // Calculate transmission time and add margin
     // Total bits per byte = start bit + data bits + parity bit (if any) + stop bits
     uint32_t bitsPerByte = 1 + dataBits + (parity != 'N' ? 1 : 0) + stopBits;
-    uint32_t transmissionTime = (length * bitsPerByte * 1000) / baudrate + 5; // + 5ms margin
+    uint32_t transmissionTime = (length * bitsPerByte * 1000) / baudrate + 10; // Increased margin
+    ESPLogger::debug("Transmission time: %lums (%lu bits/byte)", transmissionTime, bitsPerByte);
     delay(transmissionTime);
 
     setReceiveMode();
+    delayMicroseconds(100); // Additional delay for DE/RE switching
 
+    ESPLogger::debug("Frame sent: %zu/%zu bytes", written, length);
     return written == length;
 }
 
@@ -261,6 +285,8 @@ bool ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, size_t &actua
     unsigned long startTime = millis();
     unsigned long lastByteTime = startTime;
 
+    ESPLogger::debug("Waiting for response (timeout: %lums)...", responseTimeout);
+
     while (millis() - startTime < responseTimeout)
     {
         if (serial->available())
@@ -271,21 +297,45 @@ bool ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, size_t &actua
                 return false;
             }
 
-            buffer[actualLength++] = serial->read();
+            uint8_t byte = serial->read();
+            buffer[actualLength++] = byte;
             lastByteTime = millis();
+
+            ESPLogger::debug("Received byte %zu: 0x%02X", actualLength, byte);
         }
-        else if (actualLength > 0 && millis() - lastByteTime > 10)
+        else if (actualLength > 0 && millis() - lastByteTime > 20) // Increased inter-frame timeout
         {
             // Inter-frame timeout - frame complete
+            ESPLogger::debug("Inter-frame timeout reached, frame complete");
             break;
         }
 
         yield(); // Allow other tasks to run
     }
 
+    unsigned long totalTime = millis() - startTime;
+    ESPLogger::debug("Response received: %zu bytes in %lums", actualLength, totalTime);
+
+    // Log received frame for debugging
+    if (actualLength > 0)
+    {
+        String responseHex = "";
+        for (size_t i = 0; i < actualLength; i++)
+        {
+            if (i > 0)
+                responseHex += " ";
+            responseHex += String(buffer[i], HEX);
+        }
+        ESPLogger::debug("Response frame: %s", responseHex.c_str());
+    }
+
     if (actualLength < 5)
     { // Minimum frame: slave + function + data + 2 CRC bytes
-        ESPLogger::error("Response too short: %zu bytes", actualLength);
+        ESPLogger::error("Response too short: %zu bytes (minimum 5 required)", actualLength);
+        if (actualLength == 0)
+        {
+            ESPLogger::error("No response received - check device address, baud rate, and wiring");
+        }
         return false;
     }
 
@@ -295,6 +345,7 @@ bool ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, size_t &actua
         return false;
     }
 
+    ESPLogger::debug("Frame received and validated successfully");
     return true;
 }
 
@@ -339,7 +390,8 @@ void ModbusClient::setTransmitMode()
     if (dePin >= 0)
     {
         digitalWrite(dePin, HIGH);
-        delayMicroseconds(50); // Small delay for switching
+        delayMicroseconds(200); // Increased delay for MAX485 switching
+        ESPLogger::debug("DE/RE pin set to TRANSMIT mode");
     }
 }
 
@@ -348,7 +400,8 @@ void ModbusClient::setReceiveMode()
     if (dePin >= 0)
     {
         digitalWrite(dePin, LOW);
-        delayMicroseconds(50); // Small delay for switching
+        delayMicroseconds(200); // Increased delay for MAX485 switching
+        ESPLogger::debug("DE/RE pin set to RECEIVE mode");
     }
 }
 
@@ -364,6 +417,9 @@ size_t ModbusClient::buildReadFrame(uint8_t slaveId, uint8_t function, uint16_t 
     uint16_t crc = calculateCRC(frame, 6);
     frame[6] = crc & 0xFF;
     frame[7] = (crc >> 8) & 0xFF;
+
+    ESPLogger::debug("Built frame: slave=%d, func=0x%02X, addr=0x%04X, count=%d, crc=0x%04X",
+                     slaveId, function, startAddr, count, crc);
 
     return 8;
 }

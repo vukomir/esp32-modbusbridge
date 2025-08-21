@@ -11,7 +11,6 @@
 #include "WebUI.h"
 #include "MQTTClient.h"
 #include "ModbusClient.h"
-#include "ModbusScanner.h"
 #include "Poller.h"
 
 // Global instances
@@ -21,9 +20,6 @@ static WebUI webUI(config, wifiManager);
 static MQTTClient mqttClient(config, wifiManager);
 static ModbusClient modbusClient(config);
 static Poller poller(config, mqttClient, modbusClient);
-
-// Modbus device scanning on boot
-void runModbusBootScan();
 
 // FreeRTOS task handles
 TaskHandle_t webTaskHandle = NULL;
@@ -36,124 +32,6 @@ void webTask(void *parameter);
 void mqttTask(void *parameter);
 void pollerTask(void *parameter);
 void statusTask(void *parameter);
-
-void runModbusBootScan()
-{
-    ESPLogger::info("🔍 === MODBUS DEVICE SCAN ON BOOT ===");
-    
-    if (!modbusClient.isInitialized())
-    {
-        ESPLogger::error("❌ Modbus client not initialized - skipping scan");
-        return;
-    }
-    
-    // Check MAX485 status first
-    bool max485Connected = modbusClient.isMAX485Connected();
-    ESPLogger::info("📡 MAX485 Status: %s", max485Connected ? "✅ CONNECTED" : "❌ NOT CONNECTED");
-    
-    if (!max485Connected)
-    {
-        ESPLogger::error("❌ MAX485 not detected - cannot scan for devices");
-        ESPLogger::error("🔧 Check MAX485 module wiring to GPIO4");
-        return;
-    }
-    
-    // Display current configuration
-    ESPLogger::info("📋 Current Modbus Configuration:");
-    ESPLogger::info("   Device Model: %s", config.getString("device_model", "unknown").c_str());
-    ESPLogger::info("   Configured Slave Address: %d", config.getInt("rtu_addr", 1));
-    ESPLogger::info("   Serial Config: %d baud, %d%c%d", 
-                   config.getInt("baudrate", 9600),
-                   config.getInt("data_bits", 8),
-                   config.getString("parity", "N").charAt(0),
-                   config.getInt("stop_bits", 1));
-    
-    // Create scanner and scan for devices
-    ModbusScanner scanner(modbusClient);
-    
-    ESPLogger::info("🔍 Scanning for Modbus devices (addresses 1-20)...");
-    auto foundDevices = scanner.scanAddresses(1, 20);
-    
-    // Count responding devices
-    int respondingCount = 0;
-    for (const auto& device : foundDevices)
-    {
-        if (device.responding)
-        {
-            respondingCount++;
-        }
-    }
-    
-    ESPLogger::info("📊 Scan Results: Found %d responding device(s)", respondingCount);
-    
-    if (respondingCount > 0)
-    {
-        ESPLogger::info("✅ Discovered Modbus Devices:");
-        for (const auto& device : foundDevices)
-        {
-            if (device.responding)
-            {
-                ESPLogger::info("   📍 Slave %d: Value=%d, Response=%lums, Type=%s", 
-                               device.slaveId, 
-                               device.testRegisterValue,
-                               device.responseTime,
-                               device.serialConfig.c_str());
-            }
-        }
-        
-        // Check if configured device is responding
-        uint8_t configuredAddr = config.getInt("rtu_addr", 1);
-        bool configuredDeviceFound = false;
-        
-        for (const auto& device : foundDevices)
-        {
-            if (device.slaveId == configuredAddr && device.responding)
-            {
-                configuredDeviceFound = true;
-                break;
-            }
-        }
-        
-        if (configuredDeviceFound)
-        {
-            ESPLogger::info("✅ Configured device (address %d) is responding", configuredAddr);
-        }
-        else
-        {
-            ESPLogger::warn("⚠️  Configured device (address %d) NOT responding", configuredAddr);
-            ESPLogger::warn("💡 Consider updating RTU address to match a responding device");
-        }
-        
-        // Publish scan results to MQTT
-        if (mqttClient.isInitialized())
-        {
-            String scanResults = "{\"responding_devices\":" + String(respondingCount) + 
-                               ",\"configured_address\":" + String(configuredAddr) +
-                               ",\"configured_responding\":" + (configuredDeviceFound ? "true" : "false") + "}";
-            mqttClient.publishDiagnostics("modbus_scan", scanResults);
-        }
-    }
-    else
-    {
-        ESPLogger::warn("❌ No Modbus devices found");
-        ESPLogger::warn("🔧 Troubleshooting checklist:");
-        ESPLogger::warn("   1. Check RS485 A/B wiring");
-        ESPLogger::warn("   2. Verify device power");
-        ESPLogger::warn("   3. Confirm device slave address");
-        ESPLogger::warn("   4. Try different baud rates");
-        ESPLogger::warn("   5. Check RS485 termination resistors");
-        
-        // Publish no devices found status
-        if (mqttClient.isInitialized())
-        {
-            String noDevicesResult = "{\"responding_devices\":0,\"scan_completed\":true,\"timestamp\":" + 
-                                   String(millis()) + "}";
-            mqttClient.publishDiagnostics("modbus_scan", noDevicesResult);
-        }
-    }
-    
-    ESPLogger::info("🔍 === BOOT SCAN COMPLETE ===");
-}
 
 void setup()
 {
@@ -194,10 +72,7 @@ void setup()
 
     mqttClient.begin();
     modbusClient.begin();
-    
-    // Run Modbus device scan on boot
-    runModbusBootScan();
-    
+
     poller.begin();
 
     ESPLogger::info("");
