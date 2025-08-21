@@ -42,6 +42,10 @@ private:
     bool readEnergyRegisters(std::vector<TelemetryPoint> &out);
     bool readInstantaneousRegisters(std::vector<TelemetryPoint> &out);
     
+    // Optimized block parsing methods
+    void parseEnergyFromBlock(uint16_t* block, std::vector<TelemetryPoint> &out);
+    void parseInstantaneousFromBlock(uint16_t* block, std::vector<TelemetryPoint> &out);
+    
     // Utility methods
     uint32_t combine32BitValue(uint16_t low, uint16_t high) const;
     bool isValidRegisterValue(uint16_t value) const;
