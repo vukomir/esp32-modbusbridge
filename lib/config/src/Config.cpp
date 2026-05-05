@@ -203,6 +203,23 @@ bool Config::validate()
 
 bool Config::isValidDeviceModel(const String &model) const
 {
+    // Allow JSON devices (format: "json:device_id")
+    if (model.startsWith("json:"))
+    {
+        // Extract device_id and check if file exists
+        String deviceId = model.substring(5); // Skip "json:" prefix
+        String jsonPath = "/devices/" + deviceId + ".json";
+
+        if (!LittleFS.exists(jsonPath))
+        {
+            ESPLogger::error("JSON device config not found: %s", jsonPath.c_str());
+            ESPLogger::error("Upload the file via /diagnostics -> Device JSON Manager");
+            return false;
+        }
+        return true;
+    }
+
+    // Check built-in devices
     for (size_t i = 0; i < SUPPORTED_DEVICES_COUNT; i++)
     {
         if (model == SUPPORTED_DEVICES[i].model)

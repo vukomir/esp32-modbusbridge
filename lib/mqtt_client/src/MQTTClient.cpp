@@ -1,5 +1,6 @@
 #include "MQTTClient.h"
 #include <ESPLogger.h>
+#include <ArduinoJson.h>
 
 MQTTClient::MQTTClient(Config &config, WiFiManager &wifiManager)
     : config(config), wifiManager(wifiManager), mqttClient(wifiClient),
@@ -300,17 +301,15 @@ bool MQTTClient::publish(const String &metric, const String &value, bool retain)
 
 bool MQTTClient::publishStatus(const String &status)
 {
-    // Use new format with JSON
-    String jsonStatus = "{"
-                        "\"status\":\"" +
-                        status + "\","
-                                 "\"timestamp\":" +
-                        String(millis()) + ","
-                                           "\"uptime\":" +
-                        String(millis() / 1000) + ","
-                                                  "\"device_id\":\"" +
-                        getDeviceId() + "\""
-                                        "}";
+    // Use ArduinoJson to avoid heap fragmentation
+    StaticJsonDocument<256> doc;
+    doc["status"] = status;
+    doc["timestamp"] = millis();
+    doc["uptime"] = millis() / 1000;
+    doc["device_id"] = getDeviceId();
+
+    String jsonStatus;
+    serializeJson(doc, jsonStatus);
     return publishJson(MQTT_DATA_TYPE_STATUS, MQTT_METRIC_CONNECTION, jsonStatus, true);
 }
 
@@ -320,34 +319,31 @@ bool MQTTClient::publishRSSI()
     {
         return false;
     }
-    // Use new format with JSON
-    String jsonRSSI = "{"
-                      "\"rssi\":" +
-                      String(wifiManager.getRSSI()) + ","
-                                                      "\"unit\":\"dBm\","
-                                                      "\"timestamp\":" +
-                      String(millis()) + ","
-                                         "\"uptime\":" +
-                      String(millis() / 1000) + ","
-                                                "\"device_id\":\"" +
-                      getDeviceId() + "\""
-                                      "}";
+
+    StaticJsonDocument<256> doc;
+    doc["rssi"] = wifiManager.getRSSI();
+    doc["unit"] = "dBm";
+    doc["timestamp"] = millis();
+    doc["uptime"] = millis() / 1000;
+    doc["device_id"] = getDeviceId();
+
+    String jsonRSSI;
+    serializeJson(doc, jsonRSSI);
     return publishJson(MQTT_DATA_TYPE_DIAGNOSTICS, MQTT_METRIC_RSSI, jsonRSSI, true);
 }
 
 bool MQTTClient::publishUptime()
 {
     unsigned long uptimeSeconds = millis() / 1000;
-    // Use new format with JSON
-    String jsonUptime = "{"
-                        "\"uptime\":" +
-                        String(uptimeSeconds) + ","
-                                                "\"unit\":\"seconds\","
-                                                "\"timestamp\":" +
-                        String(millis()) + ","
-                                           "\"device_id\":\"" +
-                        getDeviceId() + "\""
-                                        "}";
+
+    StaticJsonDocument<256> doc;
+    doc["uptime"] = uptimeSeconds;
+    doc["unit"] = "seconds";
+    doc["timestamp"] = millis();
+    doc["device_id"] = getDeviceId();
+
+    String jsonUptime;
+    serializeJson(doc, jsonUptime);
     return publishJson(MQTT_DATA_TYPE_STATUS, MQTT_METRIC_UPTIME, jsonUptime, true);
 }
 
@@ -368,7 +364,14 @@ bool MQTTClient::publishTelemetry(const String &metric, const String &value, con
     // Add JSON format if enabled
     if (config.getBool("mqtt_json_format", true) && !unit.isEmpty())
     {
-        payload = "{\"value\":" + value + ",\"unit\":\"" + unit + "\",\"timestamp\":" + String(millis()) + ",\"device_id\":\"" + getDeviceId() + "\"}";
+        StaticJsonDocument<256> doc;
+        doc["value"] = serialized(value); // Use raw JSON value, not quoted string
+        doc["unit"] = unit;
+        doc["timestamp"] = millis();
+        doc["device_id"] = getDeviceId();
+
+        payload = "";
+        serializeJson(doc, payload);
     }
 
     bool success = mqttClient.publish(topic.c_str(), payload.c_str(), useRetain);
@@ -476,11 +479,31 @@ bool MQTTClient::publishConfig(const String &metric, const String &value, bool r
     return success;
 }
 
+bool MQTTClient::publishAvailability(bool online, bool retain)
+{
+    // Publish to {prefix}/{deviceType}/status/availability with the canonical
+    // string values "online" / "offline" (matches Home Assistant's defaults).
+    // Retained so a fresh subscriber sees the last known state.
+    const char *payload = online ? "online" : "offline";
+    return publishStatus(MQTT_METRIC_AVAILABILITY, payload, retain);
+}
+
 bool MQTTClient::publishJson(const String &dataType, const String &metric, const String &jsonPayload, bool retain)
 {
     if (!isConnected())
     {
         return false;
+    }
+
+    // Validate payload size against MQTT_MAX_PACKET_SIZE (512 bytes)
+    // Leave 50 bytes headroom for MQTT headers and topic
+    const size_t maxPayloadSize = 450;
+    if (jsonPayload.length() > maxPayloadSize)
+    {
+        ESPLogger::error("JSON payload too large: %d bytes (max %d) for topic %s/%s",
+                         jsonPayload.length(), maxPayloadSize, dataType.c_str(), metric.c_str());
+        ESPLogger::error("Payload will be truncated by PubSubClient! Consider splitting or reducing data.");
+        // Continue anyway but warn - truncation will happen
     }
 
     String topic = buildGenericTopic(dataType, metric);
@@ -493,7 +516,7 @@ bool MQTTClient::publishJson(const String &dataType, const String &metric, const
     }
     else
     {
-        ESPLogger::error("Failed to publish JSON: %s", topic.c_str());
+        ESPLogger::error("Failed to publish JSON: %s (payload size: %d bytes)", topic.c_str(), jsonPayload.length());
     }
 
     return success;
@@ -580,61 +603,44 @@ void MQTTClient::publishConnectStatus()
     // Publish connection status
     publishStatus("online");
 
-    // Publish system info as JSON
-    String systemInfo = "{"
-                        "\"device_id\":\"" +
-                        getDeviceId() + "\","
-                                        "\"mac_address\":\"" +
-                        wifiManager.getMACAddress() + "\","
-                                                      "\"ip_address\":\"" +
-                        wifiManager.getIPAddress() + "\","
-                                                     "\"hostname\":\"" +
-                        wifiManager.getNetworkHostname() + "\","
-                                                           "\"firmware_version\":\"" +
-                        String(FIRMWARE_VERSION) + "\","
-                                                   "\"build_mode\":\"" +
-                        String(BUILD_MODE) + "\","
-                                             "\"git_hash\":\"" +
-                        String(GIT_HASH) + "\","
-                                           "\"git_branch\":\"" +
-                        String(GIT_BRANCH) + "\","
-                                             "\"build_date\":\"" +
-                        String(BUILD_DATE) + "\","
-                                             "\"build_time\":\"" +
-                        String(BUILD_TIME) + "\","
-                                             "\"device_name\":\"" +
-                        String(DEVICE_NAME) + "\","
-                                              "\"free_heap\":" +
-                        String(ESP.getFreeHeap()) + ","
-                                                    "\"timestamp\":" +
-                        String(millis()) + ","
-                                           "\"uptime\":" +
-                        String(millis() / 1000);
+    // Publish system info as JSON using ArduinoJson
+    StaticJsonDocument<512> sysDoc;
+    sysDoc["device_id"] = getDeviceId();
+    sysDoc["mac_address"] = wifiManager.getMACAddress();
+    sysDoc["ip_address"] = wifiManager.getIPAddress();
+    sysDoc["hostname"] = wifiManager.getNetworkHostname();
+    sysDoc["firmware_version"] = FIRMWARE_VERSION;
+    sysDoc["build_mode"] = BUILD_MODE;
+    sysDoc["git_hash"] = GIT_HASH;
+    sysDoc["git_branch"] = GIT_BRANCH;
+    sysDoc["build_date"] = BUILD_DATE;
+    sysDoc["build_time"] = BUILD_TIME;
+    sysDoc["device_name"] = DEVICE_NAME;
+    sysDoc["free_heap"] = ESP.getFreeHeap();
+    sysDoc["timestamp"] = millis();
+    sysDoc["uptime"] = millis() / 1000;
 
     if (!wifiManager.isAPMode())
     {
-        systemInfo += ",\"wifi_ssid\":\"" + wifiManager.getSSID() + "\"";
-        systemInfo += ",\"wifi_rssi\":" + String(wifiManager.getRSSI());
+        sysDoc["wifi_ssid"] = wifiManager.getSSID();
+        sysDoc["wifi_rssi"] = wifiManager.getRSSI();
     }
 
-    systemInfo += "}";
+    String systemInfo;
+    serializeJson(sysDoc, systemInfo);
     publishJson(MQTT_DATA_TYPE_STATUS, MQTT_METRIC_SYSTEM_INFO, systemInfo, true);
 
-    // Publish configuration info as JSON
-    String configInfo = "{"
-                        "\"device_model\":\"" +
-                        config.getString("device_model") + "\","
-                                                           "\"device_type\":\"" +
-                        getDeviceType() + "\","
-                                          "\"poll_interval\":" +
-                        String(config.getInt("poll_interval_sec")) + ","
-                                                                     "\"read_storage\":" +
-                        String(config.getBool("read_storage_regs") ? "true" : "false") + ","
-                                                                                         "\"mqtt_json_format\":" +
-                        String(config.getBool("mqtt_json_format", true) ? "true" : "false") + ","
-                                                                                              "\"timestamp\":" +
-                        String(millis()) +
-                        "}";
+    // Publish configuration info as JSON using ArduinoJson
+    StaticJsonDocument<256> cfgDoc;
+    cfgDoc["device_model"] = config.getString("device_model");
+    cfgDoc["device_type"] = getDeviceType();
+    cfgDoc["poll_interval"] = config.getInt("poll_interval_sec");
+    cfgDoc["read_storage"] = config.getBool("read_storage_regs");
+    cfgDoc["mqtt_json_format"] = config.getBool("mqtt_json_format", true);
+    cfgDoc["timestamp"] = millis();
+
+    String configInfo;
+    serializeJson(cfgDoc, configInfo);
     publishJson(MQTT_DATA_TYPE_CONFIG, MQTT_METRIC_CONFIG_INFO, configInfo, true);
 
     // Also publish individual status items for backward compatibility during transition

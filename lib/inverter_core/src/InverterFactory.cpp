@@ -2,14 +2,26 @@
 #include "SolplanetASW.h"
 #include "HikingDDS238.h"
 #include "DDS238Simulator.h"
+#include "GenericModbusDevice.h"
 #include "ModbusClient.h"
 #include "constants.h"
 #include <memory>
 
 std::unique_ptr<InverterInterface> InverterFactory::create(const String &model, ModbusClient &modbus, Config &config)
 {
-    if (model == SOLPLANET_ASW_MODEL)
+    // Check if this is a JSON-based device (format: "json:filename.json")
+    if (model.startsWith("json:"))
     {
+        String jsonFile = "/devices/" + model.substring(5); // Remove "json:" prefix
+        return std::unique_ptr<InverterInterface>(new GenericModbusDevice(modbus, config, jsonFile));
+    }
+
+    // Builtin C++ device classes
+    if (model == SOLPLANET_ASW_MODEL || model == "solplanet_asw_hybrid")
+    {
+        // Both GEN and HYBRID series use the same SolplanetASW class
+        // Phase configuration is auto-detected from register 31001
+        // Backward compatibility: old "solplanet_asw_hybrid" configs still work
         return std::unique_ptr<InverterInterface>(new SolplanetASW(modbus, config));
     }
     else if (model == HIKING_DDS238_MODEL)
@@ -25,6 +37,12 @@ std::unique_ptr<InverterInterface> InverterFactory::create(const String &model, 
 
 String InverterFactory::getDeviceType(const String &model)
 {
+    // JSON devices are type "custom"
+    if (model.startsWith("json:"))
+    {
+        return "custom";
+    }
+
     for (size_t i = 0; i < SUPPORTED_DEVICES_COUNT; i++)
     {
         if (model == SUPPORTED_DEVICES[i].model)

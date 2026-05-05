@@ -14,6 +14,17 @@
 typedef bool boolean;
 typedef uint8_t byte;
 
+// PROGMEM support (for ArduinoJson compatibility)
+#define PROGMEM
+#define PSTR(s) (s)
+#define pgm_read_byte(addr) (*(const unsigned char *)(addr))
+#define pgm_read_word(addr) (*(const unsigned short *)(addr))
+#define pgm_read_dword(addr) (*(const unsigned long *)(addr))
+
+// Flash string helper class
+class __FlashStringHelper;
+#define F(string_literal) (reinterpret_cast<const __FlashStringHelper *>(string_literal))
+
 // Pin modes
 #define INPUT 0
 #define OUTPUT 1
@@ -71,6 +82,11 @@ public:
         return pos == std::string::npos ? -1 : static_cast<int>(pos);
     }
     
+    // Concatenation methods (for ArduinoJson compatibility)
+    bool concat(const String& s) { str += s.str; return true; }
+    bool concat(const char* s) { if (s) str += s; return true; }
+    bool concat(char c) { str += c; return true; }
+
     // Modification
     void trim() {
         str.erase(0, str.find_first_not_of(" \t\n\r"));
@@ -98,25 +114,61 @@ public:
     }
 };
 
+// Mock Printable base class (for ArduinoJson compatibility)
+class Print;
+class Printable {
+public:
+    virtual ~Printable() {}
+    virtual size_t printTo(Print& p) const = 0;
+};
+
+// Mock Print base class (for ArduinoJson compatibility)
+class Print {
+public:
+    virtual ~Print() {}
+    virtual size_t write(uint8_t) = 0;
+    virtual size_t write(const uint8_t* buffer, size_t size) {
+        size_t n = 0;
+        while (size--) {
+            n += write(*buffer++);
+        }
+        return n;
+    }
+
+    size_t print(const char* s) { return write((const uint8_t*)s, strlen(s)); }
+    size_t print(const String& s) { return write((const uint8_t*)s.c_str(), s.length()); }
+    size_t print(const Printable& x) { return x.printTo(*this); }
+    size_t println(const char* s) { size_t n = print(s); n += write('\n'); return n; }
+    size_t println(const String& s) { size_t n = print(s); n += write('\n'); return n; }
+    size_t println(const Printable& x) { size_t n = print(x); n += write('\n'); return n; }
+    size_t println() { return write('\n'); }
+};
+
+// Mock Stream class (for ArduinoJson compatibility)
+class Stream : public Print {
+public:
+    virtual int available() = 0;
+    virtual int read() = 0;
+    virtual int peek() = 0;
+};
+
 // Mock Serial class
-class MockSerial {
+class MockSerial : public Stream {
 public:
     void begin(unsigned long baud) {}
     void end() {}
-    int available() { return 0; }
-    int read() { return -1; }
-    size_t write(uint8_t c) { return 1; }
-    size_t write(const uint8_t* buffer, size_t size) { return size; }
-    size_t write(const char* str) { return strlen(str); }
+    int available() override { return 0; }
+    int read() override { return -1; }
+    size_t write(uint8_t c) override { std::cout << (char)c; return 1; }
+    size_t write(const uint8_t* buffer, size_t size) override {
+        for (size_t i = 0; i < size; i++) {
+            std::cout << (char)buffer[i];
+        }
+        return size;
+    }
+    size_t write(const char* str) { return write((const uint8_t*)str, strlen(str)); }
     void flush() {}
-    int peek() { return -1; }
-    
-    // Print interface
-    size_t print(const char* s) { std::cout << s; return strlen(s); }
-    size_t print(const String& s) { std::cout << s.c_str(); return s.length(); }
-    size_t println(const char* s) { std::cout << s << std::endl; return strlen(s) + 1; }
-    size_t println(const String& s) { std::cout << s.c_str() << std::endl; return s.length() + 1; }
-    size_t println() { std::cout << std::endl; return 1; }
+    int peek() override { return -1; }
 };
 
 extern MockSerial Serial;

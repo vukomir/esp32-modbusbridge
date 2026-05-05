@@ -154,6 +154,9 @@ jobs:
     - name: Install project dependencies
       run: pio pkg install
         
+    - name: Read-only Modbus invariant check
+      run: bash scripts/check_readonly.sh
+
     - name: Static Analysis
       run: pio check --skip-packages
       continue-on-error: true

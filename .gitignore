@@ -1,3 +1,14 @@
 .pio
 .vscode/**
 .cursor/**
+
+# Build artifacts
+firmware.bin
+*.bin
+
+# OS metadata
+.DS_Store
+
+# Claude Code agent config (not committed by author preference)
+CLAUDE.md
+.claude/

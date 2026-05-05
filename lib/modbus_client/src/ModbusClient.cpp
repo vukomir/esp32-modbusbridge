@@ -156,74 +156,132 @@ bool ModbusClient::testDeviceCommunication(uint8_t slaveId)
     return result;
 }
 
-bool ModbusClient::readHoldingRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t count, uint16_t *data)
+bool ModbusClient::readHoldingRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t count, uint16_t *data, uint8_t maxAttempts)
 {
-    if (!initialized || count == 0 || count > 125)
-    {
-        return false;
-    }
-
-    // Turn on LED to indicate Modbus activity
-    ledOn();
-
-    uint8_t frame[8];
-    size_t frameLength = buildReadFrame(slaveId, 0x03, startAddr, count, frame);
-
-    bool success = false;
-    if (sendFrame(frame, frameLength))
-    {
-        uint8_t response[256];
-        size_t responseLength;
-        if (receiveFrame(response, sizeof(response), responseLength))
-        {
-            success = parseReadResponse(response, responseLength, count, data);
-        }
-        else
-        {
-            ESPLogger::error("Failed to receive holding registers response");
-        }
-    }
-    else
-    {
-        ESPLogger::error("Failed to send holding registers read frame");
-    }
-
-    // Turn off LED after operation completes
-    ledOff();
-
-    return success;
+    return readWithRetry(slaveId, FC_READ_HOLDING_REGISTERS, startAddr, count, data, maxAttempts);
 }
 
-bool ModbusClient::readInputRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t count, uint16_t *data)
+bool ModbusClient::readInputRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t count, uint16_t *data, uint8_t maxAttempts)
+{
+    return readWithRetry(slaveId, FC_READ_INPUT_REGISTERS, startAddr, count, data, maxAttempts);
+}
+
+bool ModbusClient::readWithRetry(uint8_t slaveId, uint8_t function, uint16_t startAddr, uint16_t count, uint16_t *data, uint8_t maxAttempts)
 {
     if (!initialized || count == 0 || count > 125)
     {
         return false;
     }
 
+    // Clamp maxAttempts to reasonable range (1-10)
+    if (maxAttempts < 1) maxAttempts = 1;
+    if (maxAttempts > 10) maxAttempts = 10;
+
+    uint32_t backoff = INITIAL_BACKOFF_MS;
+    for (uint8_t attempt = 1; attempt <= maxAttempts; ++attempt)
+    {
+        if (readOnce(slaveId, function, startAddr, count, data))
+        {
+            if (attempt > 1)
+            {
+                ESPLogger::info("Modbus read recovered on attempt %u/%u (slave=%u, addr=0x%04X)",
+                                attempt, maxAttempts, slaveId, startAddr);
+            }
+            return true;
+        }
+
+        if (attempt < maxAttempts)
+        {
+            ESPLogger::warn("Modbus read attempt %u/%u failed (slave=%u, addr=0x%04X); retrying in %lums",
+                            attempt, maxAttempts, slaveId, startAddr, backoff);
+            delay(backoff);
+            backoff *= 2; // 100, 200, 400ms ...
+        }
+    }
+
+    // Only log error if max attempts was > 1 (avoid noise for single-shot diagnostics)
+    if (maxAttempts > 1)
+    {
+        ESPLogger::error("Modbus read failed after %u attempts (slave=%u, addr=0x%04X, count=%u, fc=0x%02X)",
+                         maxAttempts, slaveId, startAddr, count, function);
+    }
+    return false;
+}
+
+bool ModbusClient::readOnce(uint8_t slaveId, uint8_t function, uint16_t startAddr, uint16_t count, uint16_t *data)
+{
     // Turn on LED to indicate Modbus activity
     ledOn();
 
     uint8_t frame[8];
-    size_t frameLength = buildReadFrame(slaveId, 0x04, startAddr, count, frame);
+    size_t frameLength = buildReadFrame(slaveId, function, startAddr, count, frame);
 
+    uint32_t txTime = millis();
     bool success = false;
-    if (sendFrame(frame, frameLength))
+    uint8_t exceptionCode = 0;
+
+    if (frameLength > 0 && sendFrame(frame, frameLength))
     {
+        // Log TX frame
+        ModbusFrameLog txLog;
+        txLog.timestamp = txTime;
+        txLog.isTx = true;
+        txLog.slaveId = slaveId;
+        txLog.functionCode = function;
+        txLog.startAddr = startAddr;
+        txLog.count = count;
+        txLog.success = true;
+        txLog.exceptionCode = 0;
+        txLog.hexDump = bytesToHex(frame, frameLength);
+        txLog.responseTimeMs = 0;
+        logFrame(txLog);
+
         uint8_t response[256];
         size_t responseLength;
+        uint32_t rxTime = millis();
+
         if (receiveFrame(response, sizeof(response), responseLength))
         {
+            uint32_t responseTime = rxTime - txTime;
             success = parseReadResponse(response, responseLength, count, data);
+
+            // Check for Modbus exception (response[1] has high bit set)
+            if (responseLength >= 3 && (response[1] & 0x80))
+            {
+                exceptionCode = response[2];
+                success = false;
+            }
+
+            // Log RX frame
+            ModbusFrameLog rxLog;
+            rxLog.timestamp = rxTime;
+            rxLog.isTx = false;
+            rxLog.slaveId = slaveId;
+            rxLog.functionCode = function;
+            rxLog.startAddr = startAddr;
+            rxLog.count = count;
+            rxLog.success = success;
+            rxLog.exceptionCode = exceptionCode;
+            rxLog.hexDump = bytesToHex(response, responseLength);
+            rxLog.responseTimeMs = responseTime;
+            logFrame(rxLog);
         }
         else
         {
-            ESPLogger::error("Failed to receive input registers response");
+            // Timeout - log failed RX
+            ModbusFrameLog rxLog;
+            rxLog.timestamp = millis();
+            rxLog.isTx = false;
+            rxLog.slaveId = slaveId;
+            rxLog.functionCode = function;
+            rxLog.startAddr = startAddr;
+            rxLog.count = count;
+            rxLog.success = false;
+            rxLog.exceptionCode = 0;
+            rxLog.hexDump = "TIMEOUT";
+            rxLog.responseTimeMs = millis() - txTime;
+            logFrame(rxLog);
         }
-    }
-    else
-    {
-        ESPLogger::error("Failed to send input registers read frame");
     }
 
     // Turn off LED after operation completes
@@ -270,6 +328,14 @@ bool ModbusClient::sendFrame(const uint8_t *frame, size_t length)
         return false;
     }
 
+    // Defensive: never put the bus in TX mode for a zero-length frame.
+    // buildReadFrame returns 0 if a forbidden function code is requested.
+    if (length == 0 || frame == nullptr)
+    {
+        ESPLogger::error("sendFrame: refusing zero-length or null frame");
+        return false;
+    }
+
     // Clear any pending data and ensure silent interval before transmission
     int clearedBytes = 0;
     while (serial->available())
@@ -283,7 +349,7 @@ bool ModbusClient::sendFrame(const uint8_t *frame, size_t length)
 
         // Per Modbus spec: Ensure 3.5 character times of silence after clearing buffer
         uint32_t bitsPerByte = 1 + dataBits + (parity != 'N' ? 1 : 0) + stopBits;
-        uint32_t preSilentInterval = (3.5 * bitsPerByte * 1000) / baudrate;
+        uint32_t preSilentInterval = (uint32_t)((3.5f * bitsPerByte * 1000.0f) / baudrate + 0.5f);
         ESPLogger::debug("Pre-transmission silent interval: %lums", preSilentInterval);
         delay(preSilentInterval);
     }
@@ -292,25 +358,30 @@ bool ModbusClient::sendFrame(const uint8_t *frame, size_t length)
     ESPLogger::debug("Sending Modbus frame (%zu bytes)", length);
 
     setTransmitMode();
-    delayMicroseconds(100); // Additional delay for DE/RE switching
+    delayMicroseconds(50); // Minimal delay for MAX485 enable time
 
     size_t written = serial->write(frame, length);
-    serial->flush(); // Wait for transmission to complete
+    serial->flush(); // Wait for transmission to complete (blocks until last stop bit)
 
-    // Calculate transmission time and add margin
-    // Total bits per byte = start bit + data bits + parity bit (if any) + stop bits
-    uint32_t bitsPerByte = 1 + dataBits + (parity != 'N' ? 1 : 0) + stopBits;
-    uint32_t transmissionTime = (length * bitsPerByte * 1000) / baudrate;
-    delay(transmissionTime);
-
-    // Per Modbus spec: Add silent interval (3.5 character times minimum)
-    uint32_t silentInterval = (3.5 * bitsPerByte * 1000) / baudrate;
-    delay(silentInterval);
-
+    // Switch to RX mode after transmission completes
     setReceiveMode();
-    delayMicroseconds(500); // Longer delay for proper DE/RE switching per spec
+    delayMicroseconds(500); // Longer delay for MAX485 switching + line settling
+
+    // Clear any echo/garbage from TX that might have leaked into RX buffer
+    // This is critical - some MAX485 modules echo TX data even with proper DE/RE control
+    int echoBytes = 0;
+    while (serial->available())
+    {
+        serial->read();
+        echoBytes++;
+    }
+    if (echoBytes > 0)
+    {
+        ESPLogger::debug("Cleared %d echo bytes after TX->RX switch", echoBytes);
+    }
 
     ESPLogger::debug("Frame sent: %zu/%zu bytes", written, length);
+    ESPLogger::debug("Switched to RX mode, waiting for response...");
     return written == length;
 }
 
@@ -338,15 +409,19 @@ bool ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, size_t &actua
             uint8_t byte = serial->read();
             buffer[actualLength++] = byte;
             lastByteTime = millis();
+
+            // Debug: Log each byte received
+            ESPLogger::debug("RX byte #%d: 0x%02X (%d) at +%lums",
+                           actualLength, byte, byte, millis() - startTime);
         }
-        else if (actualLength > 0 && millis() - lastByteTime > 50) // Extended timeout for reliable frame completion
+        else if (actualLength > 0 && millis() - lastByteTime > 10) // Inter-frame gap per Modbus spec (~1.5 char = ~1.6ms at 9600, 10ms is safe margin)
         {
-            // Inter-frame timeout - frame complete (extended for MAX485 switching delays)
-            ESPLogger::debug("Inter-frame timeout reached (50ms), frame complete");
+            // Inter-frame timeout - frame complete
+            ESPLogger::debug("Inter-frame timeout reached (10ms), frame complete");
             break;
         }
 
-        yield(); // Allow other tasks to run
+        vTaskDelay(pdMS_TO_TICKS(1)); // Allow other tasks to run (FreeRTOS-aware)
     }
 
     unsigned long totalTime = millis() - startTime;
@@ -444,6 +519,16 @@ void ModbusClient::setReceiveMode()
 
 size_t ModbusClient::buildReadFrame(uint8_t slaveId, uint8_t function, uint16_t startAddr, uint16_t count, uint8_t *frame)
 {
+    // SAFETY: this client is read-only by design. Refuse to construct a frame
+    // with any function code other than 0x03 (read holding) or 0x04 (read input).
+    // This is defense-in-depth — the public API never passes anything else, but
+    // a future contributor could try.
+    if (function != FC_READ_HOLDING_REGISTERS && function != FC_READ_INPUT_REGISTERS)
+    {
+        ESPLogger::error("buildReadFrame: refusing non-read function code 0x%02X (read-only client)", function);
+        return 0;
+    }
+
     frame[0] = slaveId;
     frame[1] = function;
     frame[2] = (startAddr >> 8) & 0xFF;
@@ -621,4 +706,42 @@ void ModbusClient::blinkLED(int duration)
     ledOn();
     delay(duration);
     ledOff();
+}
+
+// ========== Diagnostic Frame Logging ==========
+
+void ModbusClient::logFrame(const ModbusFrameLog &entry)
+{
+    // Circular buffer: keep last FRAME_LOG_SIZE entries
+    // Using deque for O(1) pop_front instead of vector's O(n) erase
+    if (frameLog.size() >= FRAME_LOG_SIZE)
+    {
+        frameLog.pop_front(); // O(1) removal from front
+    }
+    frameLog.push_back(entry);
+}
+
+String ModbusClient::bytesToHex(const uint8_t *data, size_t length) const
+{
+    String hex = "";
+    for (size_t i = 0; i < length; i++)
+    {
+        if (i > 0)
+            hex += " ";
+        char buf[3];
+        sprintf(buf, "%02X", data[i]);
+        hex += buf;
+    }
+    return hex;
+}
+
+std::vector<ModbusFrameLog> ModbusClient::getFrameLog() const
+{
+    // Convert deque to vector for API compatibility
+    return std::vector<ModbusFrameLog>(frameLog.begin(), frameLog.end());
+}
+
+void ModbusClient::clearFrameLog()
+{
+    frameLog.clear();
 }

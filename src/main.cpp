@@ -16,9 +16,9 @@
 // Global instances
 static Config config;
 static WiFiManager wifiManager(config);
-static WebUI webUI(config, wifiManager);
-static MQTTClient mqttClient(config, wifiManager);
 static ModbusClient modbusClient(config);
+static WebUI webUI(config, wifiManager, modbusClient);
+static MQTTClient mqttClient(config, wifiManager);
 static Poller poller(config, mqttClient, modbusClient);
 
 // Factory reset button configuration
@@ -34,6 +34,9 @@ TaskHandle_t mqttTaskHandle = NULL;
 TaskHandle_t pollerTaskHandle = NULL;
 TaskHandle_t statusTaskHandle = NULL;
 TaskHandle_t buttonTaskHandle = NULL;
+
+// Mutex for Config access (protects against concurrent read/write during config save)
+SemaphoreHandle_t configMutex = NULL;
 
 // FreeRTOS task functions
 void webTask(void *parameter);
@@ -67,6 +70,17 @@ void setup()
         ESPLogger::info("LittleFS mounted successfully");
     }
     config.begin("/config.json");
+
+    // Create mutex for Config access (protects against race conditions during config save)
+    configMutex = xSemaphoreCreateMutex();
+    if (configMutex == NULL)
+    {
+        ESPLogger::error("Failed to create config mutex!");
+    }
+    else
+    {
+        ESPLogger::info("Config mutex created successfully");
+    }
 
     // Apply log level from configuration
     String logLevel = config.getString("log_level", "info");
@@ -186,13 +200,18 @@ void mqttTask(void *parameter)
 
 void pollerTask(void *parameter)
 {
+    // Cache poll interval - read once at task start to avoid repeated config lookups
+    int pollIntervalSec = config.getInt("poll_interval_sec", 10);
+    ESPLogger::info("Poller task started with %d second interval", pollIntervalSec);
+
     for (;;)
     {
         if (poller.isInitialized())
         {
             poller.poll();
         }
-        vTaskDelay(pdMS_TO_TICKS(5000)); // 5 second delay
+
+        vTaskDelay(pdMS_TO_TICKS(pollIntervalSec * 1000));
     }
 }
 
@@ -200,7 +219,32 @@ void statusTask(void *parameter)
 {
     for (;;)
     {
+        // Memory status
         ESPLogger::info("Status - Free heap: %d bytes", ESP.getFreeHeap());
+
+        // Stack high-water marks (lower = more stack used, <100 words = warning threshold)
+        if (webTaskHandle != NULL)
+        {
+            UBaseType_t webStack = uxTaskGetStackHighWaterMark(webTaskHandle);
+            ESPLogger::info("WebTask stack free: %u words%s", webStack, webStack < 100 ? " ⚠️ LOW" : "");
+        }
+        if (mqttTaskHandle != NULL)
+        {
+            UBaseType_t mqttStack = uxTaskGetStackHighWaterMark(mqttTaskHandle);
+            ESPLogger::info("MQTTTask stack free: %u words%s", mqttStack, mqttStack < 100 ? " ⚠️ LOW" : "");
+        }
+        if (pollerTaskHandle != NULL)
+        {
+            UBaseType_t pollerStack = uxTaskGetStackHighWaterMark(pollerTaskHandle);
+            ESPLogger::info("PollerTask stack free: %u words%s", pollerStack, pollerStack < 100 ? " ⚠️ LOW" : "");
+        }
+        if (buttonTaskHandle != NULL)
+        {
+            UBaseType_t buttonStack = uxTaskGetStackHighWaterMark(buttonTaskHandle);
+            ESPLogger::info("ButtonTask stack free: %u words%s", buttonStack, buttonStack < 100 ? " ⚠️ LOW" : "");
+        }
+
+        // Network status
         if (wifiManager.isConnected())
         {
             ESPLogger::info("WiFi: %s (%s)", wifiManager.getSSID().c_str(), wifiManager.getIPAddress().c_str());
@@ -209,6 +253,7 @@ void statusTask(void *parameter)
         {
             ESPLogger::info("MQTT: Connected");
         }
+
         vTaskDelay(pdMS_TO_TICKS(30000)); // 30 second delay
     }
 }
@@ -239,13 +284,13 @@ void buttonTask(void *parameter)
             {
                 ESPLogger::warn("🏭 Factory reset triggered! (held for %lu ms)", holdTime);
 
-                // Flash LED to show reset starting
+                // Flash LED to show reset starting (using vTaskDelay instead of delay)
                 digitalWrite(2, HIGH);
-                delay(500);
+                vTaskDelay(pdMS_TO_TICKS(500));
                 digitalWrite(2, LOW);
-                delay(500);
+                vTaskDelay(pdMS_TO_TICKS(500));
                 digitalWrite(2, HIGH);
-                delay(500);
+                vTaskDelay(pdMS_TO_TICKS(500));
                 digitalWrite(2, LOW);
 
                 // Perform factory reset - exact same code as WebUI
@@ -258,12 +303,12 @@ void buttonTask(void *parameter)
                     for (int i = 0; i < 5; i++)
                     {
                         digitalWrite(2, HIGH);
-                        delay(300);
+                        vTaskDelay(pdMS_TO_TICKS(300));
                         digitalWrite(2, LOW);
-                        delay(300);
+                        vTaskDelay(pdMS_TO_TICKS(300));
                     }
 
-                    delay(3000);
+                    vTaskDelay(pdMS_TO_TICKS(3000));
                     ESP.restart();
                 }
                 else
@@ -274,9 +319,9 @@ void buttonTask(void *parameter)
                     for (int i = 0; i < 10; i++)
                     {
                         digitalWrite(2, HIGH);
-                        delay(50);
+                        vTaskDelay(pdMS_TO_TICKS(50));
                         digitalWrite(2, LOW);
-                        delay(50);
+                        vTaskDelay(pdMS_TO_TICKS(50));
                     }
                 }
             }
