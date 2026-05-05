@@ -10,6 +10,7 @@ Each device configuration is a JSON file with the following structure:
 {
   "device_id": "unique_identifier",
   "name": "Human-readable Device Name",
+  "description": "Optional description for documentation",
   "registers": [
     {
       "addr": "0x0000",
@@ -18,7 +19,8 @@ Each device configuration is a JSON file with the following structure:
       "type": "uint16",
       "scale": 1.0,
       "unit": "V",
-      "storage": false
+      "storage": false,
+      "comment": "Optional comment explaining this register"
     }
   ]
 }
@@ -27,24 +29,26 @@ Each device configuration is a JSON file with the following structure:
 ### Field Definitions
 
 **Top Level:**
-- `device_id` (string): Unique identifier for the device (no spaces, alphanumeric + underscore)
-- `name` (string): Display name shown in UI
-- `registers` (array): Array of register definitions
+- `device_id` (string, required): Unique identifier for the device (no spaces, alphanumeric + underscore)
+- `name` (string, required): Display name shown in UI
+- `description` (string, optional): Human-readable description of the device (not used by firmware, for documentation only)
+- `registers` (array, required): Array of register definitions
 
 **Register Definition:**
-- `addr` (string): Register address in hex (e.g., `"0x0000"`) or decimal (e.g., `"100"`)
-- `name` (string): Telemetry point name (will appear in MQTT topic)
-- `fc` (number): Modbus function code
+- `addr` (string, required): Register address in hex (e.g., `"0x0000"`) or decimal (e.g., `"100"`)
+- `name` (string, required): Telemetry point name (will appear in MQTT topic)
+- `fc` (number, required): Modbus function code
   - `3` = Read Holding Registers (FC 0x03)
   - `4` = Read Input Registers (FC 0x04)
-- `type` (string): Data type
+- `type` (string, required): Data type
   - `"uint16"` = Unsigned 16-bit integer (1 register)
   - `"int16"` = Signed 16-bit integer (1 register)
   - `"uint32"` = Unsigned 32-bit integer (2 registers, big-endian)
   - `"int32"` = Signed 32-bit integer (2 registers, big-endian)
-- `scale` (number): Scaling factor applied to raw value (e.g., `0.1` for 235 → 23.5V)
-- `unit` (string): Unit of measurement (e.g., `"V"`, `"A"`, `"W"`, `"kWh"`, `"%"`)
-- `storage` (boolean, optional): Set to `true` for battery/storage registers (read less frequently). Defaults to `false`.
+- `scale` (number, required): Scaling factor applied to raw value (e.g., `0.1` for 235 → 23.5V)
+- `unit` (string, required): Unit of measurement (e.g., `"V"`, `"A"`, `"W"`, `"kWh"`, `"%"`)
+- `storage` (boolean, optional): Set to `true` for battery/storage registers (read less frequently). Defaults to `false`
+- `comment` (string, optional): Human-readable description of the register (not used by firmware, for documentation only)
 
 ### Register Addressing
 
@@ -201,7 +205,7 @@ Upload will fail if JSON is invalid. Validate your JSON using an online validato
 - **Function codes:** Only FC 0x03 (Read Holding) and FC 0x04 (Read Input) supported
   - No support for coils (FC 0x01, 0x02) or write operations (FC 0x05, 0x06, 0x10)
 - **No computed values:** Cannot calculate power from V×A in JSON (do this in Home Assistant templates)
-- **Comments field:** The `"comment"` field in JSON is for documentation only - firmware ignores it
+- **Documentation fields:** The `"description"` (top-level) and `"comment"` (register-level) fields are ignored by firmware - use them to document your configuration
 
 ## Example Files
 
