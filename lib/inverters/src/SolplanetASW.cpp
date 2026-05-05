@@ -194,6 +194,13 @@ bool SolplanetASW::readBasic(std::vector<TelemetryPoint> &out)
         success = false;
     }
 
+    // Read grid energy, consumption, and EPS load data
+    if (!readGridEnergyAndLoad(out))
+    {
+        ESPLogger::warn("Failed to read grid energy/load data");
+        success = false;
+    }
+
     // Note: Temperatures are now included in readBasicMeasurements bulk read
 
     ESPLogger::info("Read %d telemetry points (%s)", out.size(), isThreePhase ? "3-phase" : "1-phase");
@@ -414,14 +421,34 @@ bool SolplanetASW::readPVInputs(std::vector<TelemetryPoint> &out)
         }
     }
 
-    // PV total power (separate read, non-contiguous with above)
-    uint16_t pvPowerRegs[2];
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31601), 2, pvPowerRegs))
+    // BULK READ OPTIMIZATION: Read 31601-31606 in one transaction (6 registers)
+    // Covers: PV total power and PV-side energy (DC side, before inverter conversion)
+    uint16_t pvEnergyBulk[6];
+    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31601), 6, pvEnergyBulk))
     {
-        uint32_t pvPower = ((uint32_t)pvPowerRegs[0] << 16) | pvPowerRegs[1];
+        // Index 0-1: 31601-31602 - PV total power (U32, W, scale 1.0)
+        uint32_t pvPower = ((uint32_t)pvEnergyBulk[0] << 16) | pvEnergyBulk[1];
         if (!isNaN_U32(pvPower))
         {
             out.push_back(TP_FULL("pv_total_power", "W", String(pvPower), 31601, "U32", 1.0f));
+        }
+
+        // Index 2-3: 31603-31604 - PV E-Today (U32, kWh, scale 0.1)
+        // This is DC-side energy before inverter losses
+        uint32_t pvEnergyToday = ((uint32_t)pvEnergyBulk[2] << 16) | pvEnergyBulk[3];
+        if (!isNaN_U32(pvEnergyToday))
+        {
+            float energyKwh = pvEnergyToday * 0.1f;
+            out.push_back(TP_FULL("pv_energy_today", "kWh", String(energyKwh, 1), 31603, "U32", 0.1f));
+        }
+
+        // Index 4-5: 31605-31606 - PV E-Total (U32, kWh, scale 0.1)
+        // Total lifetime PV energy on DC side
+        uint32_t pvEnergyTotal = ((uint32_t)pvEnergyBulk[4] << 16) | pvEnergyBulk[5];
+        if (!isNaN_U32(pvEnergyTotal))
+        {
+            float energyKwh = pvEnergyTotal * 0.1f;
+            out.push_back(TP_FULL("pv_energy_total", "kWh", String(energyKwh, 1), 31605, "U32", 0.1f));
         }
     }
 
@@ -582,6 +609,273 @@ bool SolplanetASW::readGridAndPhaseMeasurements(std::vector<TelemetryPoint> &out
     return true;
 }
 
+bool SolplanetASW::readGridEnergyAndLoad(std::vector<TelemetryPoint> &out)
+{
+    // BULK READ OPTIMIZATION: Read 31630-31633 in one transaction (4 registers)
+    // Covers: E-Consumption-Today at AC side, E-Generation-Today at AC side
+    uint16_t acEnergyBulk[4];
+    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31630), 4, acEnergyBulk))
+    {
+        // Index 0-1: 31630-31631 - E-Consumption-Today at AC side (U32, kWh, scale 0.1)
+        uint32_t consumptionToday = ((uint32_t)acEnergyBulk[0] << 16) | acEnergyBulk[1];
+        if (!isNaN_U32(consumptionToday))
+        {
+            float energyKwh = consumptionToday * 0.1f;
+            out.push_back(TP_FULL("consumption_today", "kWh", String(energyKwh, 1), 31630, "U32", 0.1f));
+        }
+
+        // Index 2-3: 31632-31633 - E-Generation-Today at AC side (U32, kWh, scale 0.1)
+        uint32_t generationToday = ((uint32_t)acEnergyBulk[2] << 16) | acEnergyBulk[3];
+        if (!isNaN_U32(generationToday))
+        {
+            float energyKwh = generationToday * 0.1f;
+            out.push_back(TP_FULL("generation_today_ac", "kWh", String(energyKwh, 1), 31632, "U32", 0.1f));
+        }
+    }
+    else
+    {
+        ESPLogger::warn("Bulk read 31630-31633 (AC energy) failed");
+    }
+
+    // BULK READ OPTIMIZATION: Read 31634-31636 in one transaction (3 registers)
+    // Covers: EPS load basic measurements (voltage, current, frequency)
+    uint16_t epsBasicBulk[3];
+    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31634), 3, epsBasicBulk))
+    {
+        // Index 0: 31634 - EPS load voltage (U16, V, scale 0.1)
+        if (!isNaN_U16(epsBasicBulk[0]))
+        {
+            float voltage = epsBasicBulk[0] * 0.1f;
+            if (voltage > 10.0f)  // Only publish if backup is active
+            {
+                out.push_back(TP_FULL("eps_voltage", "V", String(voltage, 1), 31634, "U16", 0.1f));
+            }
+        }
+
+        // Index 1: 31635 - EPS load current (U16, A, scale 0.1)
+        if (!isNaN_U16(epsBasicBulk[1]))
+        {
+            float current = epsBasicBulk[1] * 0.1f;
+            out.push_back(TP_FULL("eps_current", "A", String(current, 1), 31635, "U16", 0.1f));
+        }
+
+        // Index 2: 31636 - EPS load frequency (U16, Hz, scale 0.01)
+        if (!isNaN_U16(epsBasicBulk[2]))
+        {
+            float freq = epsBasicBulk[2] * 0.01f;
+            if (freq > 10.0f)  // Only publish if backup is active
+            {
+                out.push_back(TP_FULL("eps_frequency", "Hz", String(freq, 2), 31636, "U16", 0.01f));
+            }
+        }
+    }
+    else
+    {
+        ESPLogger::debug("Bulk read 31634-31636 (EPS basic) failed - no backup output");
+    }
+
+    // BULK READ OPTIMIZATION: Read 31637-31644 in one transaction (8 registers)
+    // Covers: EPS load power and energy
+    uint16_t epsBulk[8];
+    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31637), 8, epsBulk))
+    {
+        // Index 0-1: 31637-31638 - EPS load active power (S32, W, scale 1.0)
+        int32_t epsActivePower = (int32_t)(((uint32_t)epsBulk[0] << 16) | epsBulk[1]);
+        if (!isNaN_S32(epsActivePower))
+        {
+            out.push_back(TP_FULL("eps_active_power", "W", String(epsActivePower), 31637, "S32", 1.0f));
+        }
+
+        // Index 2-3: 31639-31640 - EPS load reactive power (S32, Var, scale 1.0)
+        int32_t epsReactivePower = (int32_t)(((uint32_t)epsBulk[2] << 16) | epsBulk[3]);
+        if (!isNaN_S32(epsReactivePower))
+        {
+            out.push_back(TP_FULL("eps_reactive_power", "Var", String(epsReactivePower), 31639, "S32", 1.0f));
+        }
+
+        // Index 4-5: 31641-31642 - E-Consumption-Today at EPS load side (U32, kWh, scale 0.1)
+        uint32_t epsConsumptionToday = ((uint32_t)epsBulk[4] << 16) | epsBulk[5];
+        if (!isNaN_U32(epsConsumptionToday))
+        {
+            float energyKwh = epsConsumptionToday * 0.1f;
+            out.push_back(TP_FULL("eps_consumption_today", "kWh", String(energyKwh, 1), 31641, "U32", 0.1f));
+        }
+
+        // Index 6-7: 31643-31644 - E-Consumption-Total at EPS load side (U32, kWh, scale 0.1)
+        uint32_t epsConsumptionTotal = ((uint32_t)epsBulk[6] << 16) | epsBulk[7];
+        if (!isNaN_U32(epsConsumptionTotal))
+        {
+            float energyKwh = epsConsumptionTotal * 0.1f;
+            out.push_back(TP_FULL("eps_consumption_total", "kWh", String(energyKwh, 1), 31643, "U32", 0.1f));
+        }
+    }
+    else
+    {
+        ESPLogger::debug("Bulk read 31637-31644 (EPS power/energy) failed - no backup output");
+    }
+
+    // BULK READ OPTIMIZATION: Read 31645-31662 in one transaction (18 registers)
+    // Covers: EPS per-phase measurements (3-phase backup systems)
+    if (isThreePhase)
+    {
+        uint16_t epsPhaseBulk[18];
+        if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31645), 18, epsPhaseBulk))
+        {
+            // Index 0-5: 31645-31650 - Phase 1/2/3 voltage and current for EPS Load
+            if (!isNaN_U16(epsPhaseBulk[0]))
+            {
+                float voltage = epsPhaseBulk[0] * 0.1f;
+                if (voltage > 10.0f)
+                    out.push_back(TP_FULL("eps_l1_voltage", "V", String(voltage, 1), 31645, "U16", 0.1f));
+            }
+            if (!isNaN_U16(epsPhaseBulk[1]))
+            {
+                float current = epsPhaseBulk[1] * 0.1f;
+                out.push_back(TP_FULL("eps_l1_current", "A", String(current, 1), 31646, "U16", 0.1f));
+            }
+            if (!isNaN_U16(epsPhaseBulk[2]))
+            {
+                float voltage = epsPhaseBulk[2] * 0.1f;
+                if (voltage > 10.0f)
+                    out.push_back(TP_FULL("eps_l2_voltage", "V", String(voltage, 1), 31647, "U16", 0.1f));
+            }
+            if (!isNaN_U16(epsPhaseBulk[3]))
+            {
+                float current = epsPhaseBulk[3] * 0.1f;
+                out.push_back(TP_FULL("eps_l2_current", "A", String(current, 1), 31648, "U16", 0.1f));
+            }
+            if (!isNaN_U16(epsPhaseBulk[4]))
+            {
+                float voltage = epsPhaseBulk[4] * 0.1f;
+                if (voltage > 10.0f)
+                    out.push_back(TP_FULL("eps_l3_voltage", "V", String(voltage, 1), 31649, "U16", 0.1f));
+            }
+            if (!isNaN_U16(epsPhaseBulk[5]))
+            {
+                float current = epsPhaseBulk[5] * 0.1f;
+                out.push_back(TP_FULL("eps_l3_current", "A", String(current, 1), 31650, "U16", 0.1f));
+            }
+
+            // Index 6-17: 31651-31662 - Phase 1/2/3 active & reactive power for EPS Load
+            // Phase 1 active power
+            uint32_t epsL1Power = ((uint32_t)epsPhaseBulk[6] << 16) | epsPhaseBulk[7];
+            if (!isNaN_U32(epsL1Power))
+            {
+                out.push_back(TP_FULL("eps_l1_active_power", "W", String(epsL1Power), 31651, "U32", 1.0f));
+            }
+            // Phase 1 reactive power
+            int32_t epsL1Reactive = (int32_t)(((uint32_t)epsPhaseBulk[8] << 16) | epsPhaseBulk[9]);
+            if (!isNaN_S32(epsL1Reactive))
+            {
+                out.push_back(TP_FULL("eps_l1_reactive_power", "Var", String(epsL1Reactive), 31653, "S32", 1.0f));
+            }
+
+            // Phase 2 active power
+            uint32_t epsL2Power = ((uint32_t)epsPhaseBulk[10] << 16) | epsPhaseBulk[11];
+            if (!isNaN_U32(epsL2Power))
+            {
+                out.push_back(TP_FULL("eps_l2_active_power", "W", String(epsL2Power), 31655, "U32", 1.0f));
+            }
+            // Phase 2 reactive power
+            int32_t epsL2Reactive = (int32_t)(((uint32_t)epsPhaseBulk[12] << 16) | epsPhaseBulk[13]);
+            if (!isNaN_S32(epsL2Reactive))
+            {
+                out.push_back(TP_FULL("eps_l2_reactive_power", "Var", String(epsL2Reactive), 31657, "S32", 1.0f));
+            }
+
+            // Phase 3 active power
+            uint32_t epsL3Power = ((uint32_t)epsPhaseBulk[14] << 16) | epsPhaseBulk[15];
+            if (!isNaN_U32(epsL3Power))
+            {
+                out.push_back(TP_FULL("eps_l3_active_power", "W", String(epsL3Power), 31659, "U32", 1.0f));
+            }
+            // Phase 3 reactive power
+            int32_t epsL3Reactive = (int32_t)(((uint32_t)epsPhaseBulk[16] << 16) | epsPhaseBulk[17]);
+            if (!isNaN_S32(epsL3Reactive))
+            {
+                out.push_back(TP_FULL("eps_l3_reactive_power", "Var", String(epsL3Reactive), 31661, "S32", 1.0f));
+            }
+        }
+        else
+        {
+            ESPLogger::debug("Bulk read 31645-31662 (EPS per-phase) failed - no 3-phase backup");
+        }
+    }
+
+    // BULK READ OPTIMIZATION: Read 31663-31678 in one transaction (16 registers)
+    // Covers: Grid power per phase (3-phase) and grid export energy
+    uint16_t gridBulk[16];
+    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31663), 16, gridBulk))
+    {
+        if (isThreePhase)
+        {
+            // Index 0-1: 31663-31664 - Phase 1 active power for Grid (U32, W, scale 1.0)
+            uint32_t gridL1Power = ((uint32_t)gridBulk[0] << 16) | gridBulk[1];
+            if (!isNaN_U32(gridL1Power))
+            {
+                out.push_back(TP_FULL("grid_l1_power", "W", String(gridL1Power), 31663, "U32", 1.0f));
+            }
+
+            // Index 2-3: 31665-31666 - Phase 1 reactive power for Grid (S32, Var, scale 1.0)
+            int32_t gridL1Reactive = (int32_t)(((uint32_t)gridBulk[2] << 16) | gridBulk[3]);
+            if (!isNaN_S32(gridL1Reactive))
+            {
+                out.push_back(TP_FULL("grid_l1_reactive", "Var", String(gridL1Reactive), 31665, "S32", 1.0f));
+            }
+
+            // Index 4-5: 31667-31668 - Phase 2 active power for Grid (U32, W, scale 1.0)
+            uint32_t gridL2Power = ((uint32_t)gridBulk[4] << 16) | gridBulk[5];
+            if (!isNaN_U32(gridL2Power))
+            {
+                out.push_back(TP_FULL("grid_l2_power", "W", String(gridL2Power), 31667, "U32", 1.0f));
+            }
+
+            // Index 6-7: 31669-31670 - Phase 2 reactive power for Grid (S32, Var, scale 1.0)
+            int32_t gridL2Reactive = (int32_t)(((uint32_t)gridBulk[6] << 16) | gridBulk[7]);
+            if (!isNaN_S32(gridL2Reactive))
+            {
+                out.push_back(TP_FULL("grid_l2_reactive", "Var", String(gridL2Reactive), 31669, "S32", 1.0f));
+            }
+
+            // Index 8-9: 31671-31672 - Phase 3 active power for Grid (U32, W, scale 1.0)
+            uint32_t gridL3Power = ((uint32_t)gridBulk[8] << 16) | gridBulk[9];
+            if (!isNaN_U32(gridL3Power))
+            {
+                out.push_back(TP_FULL("grid_l3_power", "W", String(gridL3Power), 31671, "U32", 1.0f));
+            }
+
+            // Index 10-11: 31673-31674 - Phase 3 reactive power for Grid (S32, Var, scale 1.0)
+            int32_t gridL3Reactive = (int32_t)(((uint32_t)gridBulk[10] << 16) | gridBulk[11]);
+            if (!isNaN_S32(gridL3Reactive))
+            {
+                out.push_back(TP_FULL("grid_l3_reactive", "Var", String(gridL3Reactive), 31673, "S32", 1.0f));
+            }
+        }
+
+        // Index 12-13: 31675-31676 - Energy charge today for Grid (U32, kWh, scale 0.1)
+        uint32_t gridExportToday = ((uint32_t)gridBulk[12] << 16) | gridBulk[13];
+        if (!isNaN_U32(gridExportToday))
+        {
+            float energyKwh = gridExportToday * 0.1f;
+            out.push_back(TP_FULL("grid_export_today", "kWh", String(energyKwh, 1), 31675, "U32", 0.1f));
+        }
+
+        // Index 14-15: 31677-31678 - Energy charge total for Grid (U32, kWh, scale 0.1)
+        uint32_t gridExportTotal = ((uint32_t)gridBulk[14] << 16) | gridBulk[15];
+        if (!isNaN_U32(gridExportTotal))
+        {
+            float energyKwh = gridExportTotal * 0.1f;
+            out.push_back(TP_FULL("grid_export_total", "kWh", String(energyKwh, 1), 31677, "U32", 0.1f));
+        }
+    }
+    else
+    {
+        ESPLogger::warn("Bulk read 31663-31678 (grid power/energy) failed");
+    }
+
+    return true; // Non-fatal if some reads fail
+}
+
 bool SolplanetASW::readStorage(std::vector<TelemetryPoint> &out)
 {
     out.clear();
@@ -592,120 +886,168 @@ bool SolplanetASW::readStorage(std::vector<TelemetryPoint> &out)
         return false;
     }
 
-    // Register 31607: BMS1 Battery communication status (E16)
+    // BULK READ OPTIMIZATION: Read 31607-31629 in one transaction (23 registers)
+    // Covers: BMS1 battery communication, status, voltage, current, power, temperature, SOC, SOH, charge/discharge energy
+    uint16_t batteryBulk[23];
+    if (!modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31607), 23, batteryBulk))
+    {
+        ESPLogger::error("Bulk read 31607-31629 (battery) failed");
+        return false;
+    }
+
+    // Index 0: 31607 - BMS1 Battery communication status (E16)
     // 0x000A=Normal, 0x0005=Error
-    uint16_t bmsComm;
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31607), 1, &bmsComm))
+    if (!isNaN_U16(batteryBulk[0]))
     {
-        if (!isNaN_U16(bmsComm))
-        {
-            out.push_back(TP_FULL("battery_comm_status", "", String(bmsComm, HEX), 31607, "E16", 1.0f));
-        }
+        out.push_back(TP_FULL("battery_comm_status", "", String(batteryBulk[0], HEX), 31607, "E16", 1.0f));
     }
 
-    // Register 31608: BMS1 Battery status (E16)
+    // Index 1: 31608 - BMS1 Battery status (E16)
     // 0=N/A, 1=Idle, 2=Charging, 3=Discharging, 4=Error
-    uint16_t bmsStatus;
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31608), 1, &bmsStatus))
+    if (!isNaN_U16(batteryBulk[1]))
     {
-        if (!isNaN_U16(bmsStatus))
+        uint16_t bmsStatus = batteryBulk[1];
+        out.push_back(TP_FULL("battery_status", "", String(bmsStatus), 31608, "E16", 1.0f));
+        String statusText;
+        switch (bmsStatus)
         {
-            out.push_back(TP_FULL("battery_status", "", String(bmsStatus), 31608, "E16", 1.0f));
-            String statusText;
-            switch (bmsStatus)
-            {
-            case 0:
-                statusText = "N/A";
-                break;
-            case 1:
-                statusText = "Idle";
-                break;
-            case 2:
-                statusText = "Charging";
-                break;
-            case 3:
-                statusText = "Discharging";
-                break;
-            case 4:
-                statusText = "Error";
-                break;
-            default:
-                statusText = String(bmsStatus);
-            }
-            out.push_back(TP_FULL("battery_status_text", "", statusText, 31608, "E16", 1.0f));
+        case 0: statusText = "N/A"; break;
+        case 1: statusText = "Idle"; break;
+        case 2: statusText = "Charging"; break;
+        case 3: statusText = "Discharging"; break;
+        case 4: statusText = "Error"; break;
+        default: statusText = String(bmsStatus);
         }
+        out.push_back(TP_FULL("battery_status_text", "", statusText, 31608, "E16", 1.0f));
     }
 
-    // Register 31617: BMS1 Battery voltage (U16, V, scale 0.01)
-    uint16_t battVoltage;
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31617), 1, &battVoltage))
+    // Index 2-9: 31609-31616 - Battery error/warning status registers (skip for now, detailed bit fields)
+
+    // Index 10: 31617 - BMS1 Battery voltage (U16, V, scale 0.01)
+    if (!isNaN_U16(batteryBulk[10]))
     {
-        if (!isNaN_U16(battVoltage))
-        {
-            float voltage = battVoltage * 0.01f;
-            out.push_back(TP_FULL("battery_voltage", "V", String(voltage, 2), 31617, "U16", 0.01f));
-        }
+        float voltage = batteryBulk[10] * 0.01f;
+        out.push_back(TP_FULL("battery_voltage", "V", String(voltage, 2), 31617, "U16", 0.01f));
     }
 
-    // Register 31618: BMS1 Battery current (S16, A, scale 0.1)
+    // Index 11: 31618 - BMS1 Battery current (S16, A, scale 0.1)
     // Positive = charging, Negative = discharging
-    uint16_t battCurrent;
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31618), 1, &battCurrent))
+    int16_t currentSigned = (int16_t)batteryBulk[11];
+    if (!isNaN_S16(currentSigned))
     {
-        int16_t currentSigned = (int16_t)battCurrent;
-        if (!isNaN_S16(currentSigned))
-        {
-            float current = currentSigned * 0.1f;
-            out.push_back(TP_FULL("battery_current", "A", String(current, 1), 31618, "S16", 0.1f));
-        }
+        float current = currentSigned * 0.1f;
+        out.push_back(TP_FULL("battery_current", "A", String(current, 1), 31618, "S16", 0.1f));
     }
 
-    // Registers 31619-31620: BMS1 Battery power (S32, W, scale 1.0)
-    uint16_t battPowerRegs[2];
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31619), 2, battPowerRegs))
+    // Index 12-13: 31619-31620 - BMS1 Battery power (S32, W, scale 1.0)
+    int32_t power = (int32_t)(((uint32_t)batteryBulk[12] << 16) | batteryBulk[13]);
+    if (!isNaN_S32(power))
     {
-        int32_t power = (int32_t)(((uint32_t)battPowerRegs[0] << 16) | battPowerRegs[1]);
-        if (!isNaN_S32(power))
-        {
-            out.push_back(TP_FULL("battery_power", "W", String(power), 31619, "S32", 1.0f));
-        }
+        out.push_back(TP_FULL("battery_power", "W", String(power), 31619, "S32", 1.0f));
     }
 
-    // Register 31621: BMS1 Battery temperature (S16, °C, scale 0.1)
-    uint16_t battTemp;
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31621), 1, &battTemp))
+    // Index 14: 31621 - BMS1 Battery temperature (S16, °C, scale 0.1)
+    int16_t tempSigned = (int16_t)batteryBulk[14];
+    if (!isNaN_S16(tempSigned))
     {
-        int16_t tempSigned = (int16_t)battTemp;
-        if (!isNaN_S16(tempSigned))
-        {
-            float temperature = tempSigned * 0.1f;
-            out.push_back(TP_FULL("battery_temperature", "C", String(temperature, 1), 31621, "S16", 0.1f));
-        }
+        float temperature = tempSigned * 0.1f;
+        out.push_back(TP_FULL("battery_temperature", "C", String(temperature, 1), 31621, "S16", 0.1f));
     }
 
-    // Register 31622: BMS1 Battery SOC (U16, %)
+    // Index 15: 31622 - BMS1 Battery SOC (U16, %)
     // NOTE: Modbus doc says scale 0.01, but actual register returns 0-100 directly (not 0-10000)
-    // Verified: battery at 99% returns raw value 100, not 9900
-    uint16_t battSOC;
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31622), 1, &battSOC))
+    if (!isNaN_U16(batteryBulk[15]))
     {
-        if (!isNaN_U16(battSOC))
-        {
-            // Register returns percentage directly (1-100), no scaling needed
-            out.push_back(TP_FULL("battery_soc", "%", String(battSOC), 31622, "U16", 1.0f));
-        }
+        out.push_back(TP_FULL("battery_soc", "%", String(batteryBulk[15]), 31622, "U16", 1.0f));
     }
 
-    // Register 31623: BMS1 Battery SOH (U16, %)
+    // Index 16: 31623 - BMS1 Battery SOH (U16, %)
     // Same issue as SOC - returns 0-100 directly
-    uint16_t battSOH;
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31623), 1, &battSOH))
+    if (!isNaN_U16(batteryBulk[16]))
     {
-        if (!isNaN_U16(battSOH))
+        out.push_back(TP_FULL("battery_soh", "%", String(batteryBulk[16]), 31623, "U16", 1.0f));
+    }
+
+    // Index 17: 31624 - BMS1 Battery charging current limit (U16, A, scale 0.1)
+    if (!isNaN_U16(batteryBulk[17]))
+    {
+        float limit = batteryBulk[17] * 0.1f;
+        out.push_back(TP_FULL("battery_charge_limit", "A", String(limit, 1), 31624, "U16", 0.1f));
+    }
+
+    // Index 18: 31625 - BMS1 Battery discharge current limit (U16, A, scale 0.1)
+    if (!isNaN_U16(batteryBulk[18]))
+    {
+        float limit = batteryBulk[18] * 0.1f;
+        out.push_back(TP_FULL("battery_discharge_limit", "A", String(limit, 1), 31625, "U16", 0.1f));
+    }
+
+    // Index 19-20: 31626-31627 - BMS1 Battery E-Charge-Today (U32, kWh, scale 0.1)
+    uint32_t chargeToday = ((uint32_t)batteryBulk[19] << 16) | batteryBulk[20];
+    if (!isNaN_U32(chargeToday))
+    {
+        float energyKwh = chargeToday * 0.1f;
+        out.push_back(TP_FULL("battery_charge_today", "kWh", String(energyKwh, 1), 31626, "U32", 0.1f));
+    }
+
+    // Index 21-22: 31628-31629 - BMS1 Battery E-Discharge-Today (U32, kWh, scale 0.1)
+    uint32_t dischargeToday = ((uint32_t)batteryBulk[21] << 16) | batteryBulk[22];
+    if (!isNaN_U32(dischargeToday))
+    {
+        float energyKwh = dischargeToday * 0.1f;
+        out.push_back(TP_FULL("battery_discharge_today", "kWh", String(energyKwh, 1), 31628, "U32", 0.1f));
+    }
+
+    // BULK READ: BMS1 advanced diagnostics (31679-31681, 3 registers)
+    uint16_t bmsDiagBulk[3];
+    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31679), 3, bmsDiagBulk))
+    {
+        // Index 0: 31679 - BMS1 Insulation resistance (U16, kΩ, scale 1.0)
+        if (!isNaN_U16(bmsDiagBulk[0]))
         {
-            // Register returns percentage directly (1-100), no scaling needed
-            out.push_back(TP_FULL("battery_soh", "%", String(battSOH), 31623, "U16", 1.0f));
+            out.push_back(TP_FULL("battery_insulation_resistance", "kOhm", String(bmsDiagBulk[0]), 31679, "U16", 1.0f));
         }
+
+        // Index 1: 31680 - BMS1 Charge/discharge cycles (U16, scale 1.0)
+        if (!isNaN_U16(bmsDiagBulk[1]))
+        {
+            out.push_back(TP_FULL("battery_cycles", "", String(bmsDiagBulk[1]), 31680, "U16", 1.0f));
+        }
+
+        // Index 2: 31681 - BMS1 Environment temperature (U16, °C, scale 0.1)
+        if (!isNaN_U16(bmsDiagBulk[2]))
+        {
+            float envTemp = bmsDiagBulk[2] * 0.1f;
+            out.push_back(TP_FULL("battery_env_temperature", "C", String(envTemp, 1), 31681, "U16", 0.1f));
+        }
+    }
+    else
+    {
+        ESPLogger::debug("Bulk read 31679-31681 (BMS diagnostics) failed - not critical");
+    }
+
+    // BULK READ: Diesel generator power (31685-31687, 3 registers)
+    uint16_t genBulk[3];
+    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31685), 3, genBulk))
+    {
+        // Index 0-1: 31685-31686 - Oil engine power (S32, W, scale 1.0)
+        int32_t genPower = (int32_t)(((uint32_t)genBulk[0] << 16) | genBulk[1]);
+        if (!isNaN_S32(genPower))
+        {
+            out.push_back(TP_FULL("generator_power", "W", String(genPower), 31685, "S32", 1.0f));
+        }
+
+        // Index 2: 31687 - The power of the daily oil engine (U32, kWh, scale 0.1)
+        // Note: Register 31687 is a single U16, not U32 as documented - treating as U16 for now
+        if (!isNaN_U16(genBulk[2]))
+        {
+            float genEnergyKwh = genBulk[2] * 0.1f;
+            out.push_back(TP_FULL("generator_energy_today", "kWh", String(genEnergyKwh, 1), 31687, "U16", 0.1f));
+        }
+    }
+    else
+    {
+        ESPLogger::debug("Bulk read 31685-31687 (generator) failed - likely no gen-set connected");
     }
 
     ESPLogger::info("Read %d battery telemetry points", out.size());

@@ -79,12 +79,7 @@ mqtt:
     - name: "Solar Active Power"
       unique_id: solar_active_power
       state_topic: "home/inverter/telemetry/active_power"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "W"
       device_class: power
       state_class: measurement
@@ -103,12 +98,7 @@ mqtt:
     - name: "Solar Daily Production"
       unique_id: solar_daily_production
       state_topic: "home/inverter/telemetry/energy_today"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "kWh"
       device_class: energy
       state_class: total_increasing
@@ -120,12 +110,7 @@ mqtt:
     - name: "Solar Total Production"
       unique_id: solar_total_production
       state_topic: "home/inverter/telemetry/energy_total"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "kWh"
       device_class: energy
       state_class: total_increasing
@@ -137,12 +122,7 @@ mqtt:
     - name: "Solar Total Hours"
       unique_id: solar_total_hours
       state_topic: "home/inverter/telemetry/hours_total"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "h"
       device_class: duration
       state_class: total_increasing
@@ -159,12 +139,7 @@ mqtt:
     - name: "Solar L1 Voltage"
       unique_id: solar_l1_voltage
       state_topic: "home/inverter/telemetry/l1_voltage"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "V"
       device_class: voltage
       state_class: measurement
@@ -176,12 +151,7 @@ mqtt:
     - name: "Solar L1 Current"
       unique_id: solar_l1_current
       state_topic: "home/inverter/telemetry/l1_current"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "A"
       device_class: current
       state_class: measurement
@@ -194,12 +164,7 @@ mqtt:
     - name: "Solar L2 Voltage"
       unique_id: solar_l2_voltage
       state_topic: "home/inverter/telemetry/l2_voltage"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "V"
       device_class: voltage
       state_class: measurement
@@ -211,12 +176,7 @@ mqtt:
     - name: "Solar L2 Current"
       unique_id: solar_l2_current
       state_topic: "home/inverter/telemetry/l2_current"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "A"
       device_class: current
       state_class: measurement
@@ -229,12 +189,7 @@ mqtt:
     - name: "Solar L3 Voltage"
       unique_id: solar_l3_voltage
       state_topic: "home/inverter/telemetry/l3_voltage"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "V"
       device_class: voltage
       state_class: measurement
@@ -246,12 +201,7 @@ mqtt:
     - name: "Solar L3 Current"
       unique_id: solar_l3_current
       state_topic: "home/inverter/telemetry/l3_current"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "A"
       device_class: current
       state_class: measurement
@@ -264,12 +214,7 @@ mqtt:
     - name: "Solar RS Line Voltage"
       unique_id: solar_rs_line_voltage
       state_topic: "home/inverter/telemetry/rs_line_voltage"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "V"
       device_class: voltage
       state_class: measurement
@@ -281,12 +226,7 @@ mqtt:
     - name: "Solar RT Line Voltage"
       unique_id: solar_rt_line_voltage
       state_topic: "home/inverter/telemetry/rt_line_voltage"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "V"
       device_class: voltage
       state_class: measurement
@@ -298,12 +238,7 @@ mqtt:
     - name: "Solar ST Line Voltage"
       unique_id: solar_st_line_voltage
       state_topic: "home/inverter/telemetry/st_line_voltage"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "V"
       device_class: voltage
       state_class: measurement
@@ -316,12 +251,7 @@ mqtt:
     - name: "Solar Grid Frequency"
       unique_id: solar_grid_frequency
       state_topic: "home/inverter/telemetry/grid_frequency"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "Hz"
       device_class: frequency
       state_class: measurement
@@ -333,12 +263,7 @@ mqtt:
     - name: "Solar Power Factor"
       unique_id: solar_power_factor
       state_topic: "home/inverter/telemetry/power_factor"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       device_class: power_factor
       state_class: measurement
       availability:
@@ -349,12 +274,7 @@ mqtt:
     - name: "Solar Apparent Power"
       unique_id: solar_apparent_power
       state_topic: "home/inverter/telemetry/apparent_power"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "VA"
       device_class: apparent_power
       state_class: measurement
@@ -366,12 +286,7 @@ mqtt:
     - name: "Solar Reactive Power"
       unique_id: solar_reactive_power
       state_topic: "home/inverter/telemetry/reactive_power"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "var"
       device_class: reactive_power
       state_class: measurement
@@ -387,12 +302,7 @@ mqtt:
     - name: "Solar PV1 Voltage"
       unique_id: solar_pv1_voltage
       state_topic: "home/inverter/telemetry/pv1_voltage"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "V"
       device_class: voltage
       state_class: measurement
@@ -404,12 +314,7 @@ mqtt:
     - name: "Solar PV1 Current"
       unique_id: solar_pv1_current
       state_topic: "home/inverter/telemetry/pv1_current"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "A"
       device_class: current
       state_class: measurement
@@ -421,12 +326,7 @@ mqtt:
     - name: "Solar PV1 Power"
       unique_id: solar_pv1_power
       state_topic: "home/inverter/telemetry/pv1_power"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "W"
       device_class: power
       state_class: measurement
@@ -448,12 +348,7 @@ mqtt:
     - name: "Battery Power"
       unique_id: battery_power
       state_topic: "home/inverter/telemetry/battery_power"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "W"
       device_class: power
       state_class: measurement
@@ -465,12 +360,7 @@ mqtt:
     - name: "Battery Voltage"
       unique_id: battery_voltage
       state_topic: "home/inverter/telemetry/battery_voltage"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "V"
       device_class: voltage
       state_class: measurement
@@ -482,12 +372,7 @@ mqtt:
     - name: "Battery Current"
       unique_id: battery_current
       state_topic: "home/inverter/telemetry/battery_current"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "A"
       device_class: current
       state_class: measurement
@@ -499,12 +384,7 @@ mqtt:
     - name: "Battery SOC"
       unique_id: battery_soc
       state_topic: "home/inverter/telemetry/battery_soc"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "%"
       device_class: battery
       state_class: measurement
@@ -516,12 +396,7 @@ mqtt:
     - name: "Battery SOH"
       unique_id: battery_soh
       state_topic: "home/inverter/telemetry/battery_soh"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "%"
       state_class: measurement
       availability:
@@ -532,12 +407,7 @@ mqtt:
     - name: "Battery Temperature"
       unique_id: battery_temperature
       state_topic: "home/inverter/telemetry/battery_temperature"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "°C"
       device_class: temperature
       state_class: measurement
@@ -553,12 +423,7 @@ mqtt:
     - name: "Solar Internal Temperature"
       unique_id: solar_internal_temp
       state_topic: "home/inverter/telemetry/temperature_internal"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "°C"
       device_class: temperature
       state_class: measurement
@@ -570,12 +435,7 @@ mqtt:
     - name: "Solar Inverter U Temperature"
       unique_id: solar_inverter_u_temp
       state_topic: "home/inverter/telemetry/temperature_inverter_u"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "°C"
       device_class: temperature
       state_class: measurement
@@ -587,12 +447,7 @@ mqtt:
     - name: "Solar Boost Temperature"
       unique_id: solar_boost_temp
       state_topic: "home/inverter/telemetry/temperature_boost"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "°C"
       device_class: temperature
       state_class: measurement
@@ -616,12 +471,7 @@ mqtt:
     - name: "Solar Error Code"
       unique_id: solar_error_code
       state_topic: "home/inverter/telemetry/error_code"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       availability:
         - topic: "home/inverter/status/availability"
       device:
@@ -638,12 +488,7 @@ mqtt:
     - name: "Solar Warning Code"
       unique_id: solar_warning_code
       state_topic: "home/inverter/telemetry/warning_code"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       availability:
         - topic: "home/inverter/status/availability"
       device:
@@ -652,12 +497,7 @@ mqtt:
     - name: "Solar Bus Voltage"
       unique_id: solar_bus_voltage
       state_topic: "home/inverter/telemetry/bus_voltage"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "V"
       device_class: voltage
       state_class: measurement
@@ -1056,12 +896,7 @@ mqtt:
     - name: "Grid Power Consumption"
       unique_id: grid_power_consumption
       state_topic: "home/meter/telemetry/active_power"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "W"
       device_class: power
       state_class: measurement
@@ -1077,12 +912,7 @@ mqtt:
     - name: "Total Energy Consumed"
       unique_id: total_energy_consumed
       state_topic: "home/meter/telemetry/energy_total"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "kWh"
       device_class: energy
       state_class: total_increasing
@@ -1095,12 +925,7 @@ mqtt:
     - name: "Grid Voltage"
       unique_id: grid_voltage
       state_topic: "home/meter/telemetry/voltage"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "V"
       device_class: voltage
       state_class: measurement
@@ -1113,12 +938,7 @@ mqtt:
     - name: "Grid Current"
       unique_id: grid_current
       state_topic: "home/meter/telemetry/current"
-      value_template: >
-        {% if value_json is defined %}
-          {{ value_json.value }}
-        {% else %}
-          {{ value }}
-        {% endif %}
+      value_template: "{{ value_json.value | default(value) }}"
       unit_of_measurement: "A"
       device_class: current
       state_class: measurement

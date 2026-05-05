@@ -40,6 +40,7 @@ private:
     bool readBasicMeasurements(std::vector<TelemetryPoint> &out);          // Bulk: 31301-31320
     bool readPVInputs(std::vector<TelemetryPoint> &out);                   // Bulk: 31319-31338, 31339-31358
     bool readGridAndPhaseMeasurements(std::vector<TelemetryPoint> &out);   // Bulk: 31359-31379 (includes error/warning codes)
+    bool readGridEnergyAndLoad(std::vector<TelemetryPoint> &out);          // Bulk: 31630-31678 (consumption, grid export, EPS load)
 
     // Code translation (MB001 sections 3.4, 3.5)
     String getErrorDescription(uint16_t errorCode) const;
