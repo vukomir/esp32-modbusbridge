@@ -4,10 +4,12 @@
 #include "InverterFactory.h"
 #include <ESPLogger.h>
 #include "constants.h"
+#include <ArduinoJson.h>
 
 Poller::Poller(Config &config, MQTTClient &mqtt, ModbusClient &modbus)
     : config(config), mqtt(mqtt), modbus(modbus), initialized(false),
-      lastPollTime(0), successfulPolls(0), failedPolls(0)
+      lastPollTime(0), successfulPolls(0), failedPolls(0),
+      consecutiveFailures(0), publishedAvailability(AvailabilityState::Unknown)
 {
 }
 
@@ -69,6 +71,7 @@ void Poller::poll()
         publishPollStatus(false, "MAX485 module not connected");
         failedPolls++;
         ESPLogger::warn("Poll skipped - MAX485 module not connected");
+        updateAvailability(false);
         return;
     }
 
@@ -83,40 +86,79 @@ void Poller::poll()
         publishHardwareStatus("MAX485", "not_connected", "MAX485 module not detected on DE/RE pin");
         publishPollStatus(false, "MAX485 module not connected");
         failedPolls++;
+        updateAvailability(false);
         return;
     }
 
-    // Test actual device communication with configured slave address
-    uint8_t slaveAddr = config.getInt("rtu_addr", 1);
-    if (!modbus.testDeviceCommunication(slaveAddr))
-    {
-        // MAX485 connected but no device response
-        ESPLogger::warn("⚠️  Device NOT RESPONDING on slave address %d - check RS485 A/B wiring", slaveAddr);
-        publishHardwareStatus("device", "not_responding", "No response from configured device");
-        publishPollStatus(false, "Device not responding");
-        failedPolls++;
-        ESPLogger::warn("Poll skipped - Device not responding on address %d", slaveAddr);
-        return;
-    }
+    // NOTE: the previous pre-poll testDeviceCommunication() call was removed
+    // because it queries DDS238 meter registers (0x000C-0x000E), which causes
+    // SolPlanet inverters to reply with Modbus exception 0x02 ("Illegal Data
+    // Address"). That exception was being treated as failure, blocking the
+    // real telemetry read for any non-DDS238 device. The actual telemetry
+    // read below is the source of truth — if the device is unreachable, it
+    // will fail with the right error and updateAvailability() handles it.
 
-    // Both MAX485 and device are responding
+    // Determine device model/type for hardware status reporting after the read.
     String deviceModel = config.getString("device_model", DEFAULT_DEVICE_MODEL);
     String deviceType = InverterFactory::getDeviceType(deviceModel);
-    ESPLogger::info("✅ %s CONNECTED and responding via RS485", deviceModel.c_str());
-    publishHardwareStatus(deviceType, "connected", deviceModel + " responding");
 
     bool success = readAndPublishTelemetry();
     if (success)
     {
         successfulPolls++;
         publishPollStatus(true);
+        publishHardwareStatus(deviceType, "connected", deviceModel + " responding");
+        ESPLogger::info("✅ %s CONNECTED and responding via RS485", deviceModel.c_str());
         ESPLogger::debug("Poll successful - Basic: %lu total", successfulPolls);
     }
     else
     {
         failedPolls++;
         publishPollStatus(false, lastError);
+        publishHardwareStatus(deviceType, "not_responding", "No response from configured device");
         ESPLogger::error("Poll failed - %s", lastError.c_str());
+    }
+    updateAvailability(success);
+}
+
+void Poller::updateAvailability(bool pollSucceeded)
+{
+    if (pollSucceeded)
+    {
+        if (consecutiveFailures > 0)
+        {
+            ESPLogger::info("Poll recovered after %lu consecutive failure(s)", consecutiveFailures);
+        }
+        consecutiveFailures = 0;
+        if (publishedAvailability != AvailabilityState::Online)
+        {
+            if (mqtt.publishAvailability(true))
+            {
+                publishedAvailability = AvailabilityState::Online;
+                ESPLogger::info("Availability → online");
+            }
+            else
+            {
+                ESPLogger::warn("Failed to publish availability=online; will retry next poll");
+                // leave publishedAvailability as-is so we retry on next success
+            }
+        }
+        return;
+    }
+
+    consecutiveFailures++;
+    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES &&
+        publishedAvailability != AvailabilityState::Offline)
+    {
+        if (mqtt.publishAvailability(false))
+        {
+            publishedAvailability = AvailabilityState::Offline;
+            ESPLogger::warn("Availability → offline (after %lu consecutive failures)", consecutiveFailures);
+        }
+        else
+        {
+            ESPLogger::warn("Failed to publish availability=offline; will retry next poll");
+        }
     }
 }
 
@@ -221,25 +263,21 @@ void Poller::publishTelemetryPoints(const std::vector<TelemetryPoint> &points)
 
 void Poller::publishPollStatus(bool success, const String &error)
 {
-    // Create JSON object for poll status
-    String jsonStatus = "{"
-                        "\"success\":" +
-                        String(success ? "true" : "false") + ","
-                                                             "\"timestamp\":" +
-                        String(lastPollTime) + ","
-                                               "\"uptime\":" +
-                        String(millis() / 1000) + ","
-                                                  "\"successful_polls\":" +
-                        String(successfulPolls) + ","
-                                                  "\"failed_polls\":" +
-                        String(failedPolls);
+    // Use ArduinoJson to avoid heap fragmentation from String concatenation
+    StaticJsonDocument<256> doc;
+    doc["success"] = success;
+    doc["timestamp"] = lastPollTime;
+    doc["uptime"] = millis() / 1000;
+    doc["successful_polls"] = successfulPolls;
+    doc["failed_polls"] = failedPolls;
 
     if (!success && !error.isEmpty())
     {
-        jsonStatus += ",\"error\":\"" + error + "\"";
+        doc["error"] = error;
     }
 
-    jsonStatus += "}";
+    String jsonStatus;
+    serializeJson(doc, jsonStatus);
 
     // Use new generic topic structure for status
     mqtt.publishJson(MQTT_DATA_TYPE_STATUS, MQTT_METRIC_POLL_STATUS, jsonStatus, true);
@@ -247,19 +285,16 @@ void Poller::publishPollStatus(bool success, const String &error)
 
 void Poller::publishHardwareStatus(const String &component, const String &status, const String &message)
 {
-    // Create JSON object for hardware status
-    String jsonStatus = "{"
-                        "\"component\":\"" +
-                        component + "\","
-                                    "\"status\":\"" +
-                        status + "\","
-                                 "\"message\":\"" +
-                        message + "\","
-                                  "\"timestamp\":" +
-                        String(millis()) + ","
-                                           "\"uptime\":" +
-                        String(millis() / 1000) +
-                        "}";
+    // Use ArduinoJson to avoid heap fragmentation
+    StaticJsonDocument<256> doc;
+    doc["component"] = component;
+    doc["status"] = status;
+    doc["message"] = message;
+    doc["timestamp"] = millis();
+    doc["uptime"] = millis() / 1000;
+
+    String jsonStatus;
+    serializeJson(doc, jsonStatus);
 
     // Use new generic topic structure for hardware status
     String metric;

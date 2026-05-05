@@ -16,10 +16,13 @@
  * @brief Web UI server for device configuration and status
  * Provides HTML forms for config, status page, factory reset, and OTA upload
  */
+// Forward declaration
+class ModbusClient;
+
 class WebUI
 {
 public:
-    WebUI(Config &config, WiFiManager &wifiManager);
+    WebUI(Config &config, WiFiManager &wifiManager, ModbusClient &modbusClient);
     ~WebUI();
 
     bool begin(uint16_t port = 80);
@@ -30,6 +33,7 @@ public:
 private:
     Config &config;
     WiFiManager &wifiManager;
+    ModbusClient &modbusClient;
     WebServer server;
     WebSocketsServer wsServer;
     bool running;
@@ -49,6 +53,8 @@ private:
     void handleConsole();
     void handleLogConfig();
     void handleAPIStatus();
+    void handleDiagnostics();
+    void handleDiagnosticsAPI();
 
     // HTML generators
     String generateConfigForm();
@@ -71,6 +77,21 @@ private:
     void sendSuccess(const String &message);
     void sendSuccessWithRedirect(const String &message, const String &redirectUrl, int delayMs);
     String getRedirectUrl(const String &path = "/");
+
+    // Security helpers
+    // CSRF token regenerated on each boot. Lives only in RAM; if the device
+    // reboots between rendering the form and submitting it, the POST will
+    // fail with 403 and the user will need to reload. That is intentional.
+    String csrfToken;
+    String generateCSRFToken();
+    bool validateCSRFToken();          // checks server.arg("_csrf") == csrfToken
+    String csrfHiddenInput() const;    // <input type='hidden' name='_csrf' value='...'>
+    // Escapes &, <, >, ", ' so config values can be inlined in HTML attributes
+    // and text nodes safely. Stored XSS defense.
+    static String escapeHtml(const String &s);
+    // Renders a confirmation form posting to `action`. Used for /reboot, /factory.
+    String confirmActionForm(const String &action, const String &buttonLabel,
+                             const String &message, const String &btnClass) const;
 
     // Log buffer management
     struct LogEntry

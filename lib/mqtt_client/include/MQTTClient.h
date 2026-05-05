@@ -41,6 +41,12 @@ public:
     bool publishHardware(const String &metric, const String &value, bool retain = true);
     bool publishConfig(const String &metric, const String &value, bool retain = true);
 
+    // Publish device-under-monitoring availability ("online" / "offline").
+    // Retained so Home Assistant picks up the last known state on subscribe.
+    // NOTE: this is the *Modbus device* availability, not the ESP32's own MQTT
+    //       presence — that should be handled separately via MQTT LWT.
+    bool publishAvailability(bool online, bool retain = true);
+
     // JSON publishing
     bool publishJson(const String &dataType, const String &metric, const String &jsonPayload, bool retain = true);
 

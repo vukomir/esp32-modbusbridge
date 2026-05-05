@@ -42,6 +42,11 @@
 #define HIKING_DDS238_MODEL "hiking_dds238"
 #define DDS238_SIMULATOR_MODEL "dds238_simulator"
 
+// SolPlanet ASW Register Addresses (Modbus)
+// Note: Both GEN and HYBRID series use the same register map (31xxx INPUT registers, FC 0x04)
+// Phase configuration is auto-detected from register 31001
+#define ASW_DEVICE_TYPE_ADDR 0x03E8  // Register 31001: ASCII '1'=Single phase, '3'=Three phase
+
 // Device List Structure
 struct DeviceInfo
 {
@@ -52,7 +57,7 @@ struct DeviceInfo
 
 // Supported Devices List
 static const DeviceInfo SUPPORTED_DEVICES[] = {
-    {SOLPLANET_ASW_MODEL, "SolPlanet ASW GEN", "inverter"},
+    {SOLPLANET_ASW_MODEL, "SolPlanet ASW (GEN & HYBRID)", "inverter"},
     {HIKING_DDS238_MODEL, "Hiking DDS238 Smart Meter", "meter"},
     {DDS238_SIMULATOR_MODEL, "DDS238 Energy Meter Simulator", "meter"}};
 
@@ -73,5 +78,10 @@ static const DeviceInfo SUPPORTED_DEVICES[] = {
 #define MQTT_METRIC_RSSI "rssi"
 #define MQTT_METRIC_UPTIME "uptime"
 #define MQTT_METRIC_CONFIG_INFO "config_info"
+// Availability of the *device under monitoring* (NOT the ESP32 itself).
+// Published as "online" / "offline" by the Poller after K consecutive read failures.
+// Used by Home Assistant via `availability_topic` to mark sensors unavailable
+// instead of showing the last retained value as live.
+#define MQTT_METRIC_AVAILABILITY "availability"
 
 #endif // CONSTANTS_H

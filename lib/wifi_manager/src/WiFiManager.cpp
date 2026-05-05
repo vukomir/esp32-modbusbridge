@@ -87,8 +87,7 @@ bool WiFiManager::connectSTA()
 
     while (WiFi.status() != WL_CONNECTED && millis() - startTime < timeout)
     {
-        delay(200);
-        yield();
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 
     if (WiFi.status() == WL_CONNECTED)
@@ -103,7 +102,7 @@ bool WiFiManager::connectSTA()
         ESPLogger::info("🔍 DNS: %s", WiFi.dnsIP().toString().c_str());
 
         // Wait a bit for network to stabilize before starting services
-        delay(1000);
+        vTaskDelay(pdMS_TO_TICKS(1000));
 
         // Setup NTP time synchronization
         setupNTP();
@@ -356,7 +355,7 @@ bool WiFiManager::setupmDNS()
 
     // Stop any existing mDNS first
     MDNS.end();
-    delay(500); // Longer delay to ensure clean shutdown
+    vTaskDelay(pdMS_TO_TICKS(500)); // Longer delay to ensure clean shutdown
 
     String hostname = getHostname();
     ESPLogger::info("🚀 Starting mDNS setup...");
@@ -393,7 +392,7 @@ bool WiFiManager::setupmDNS()
             ESPLogger::warn("❌ mDNS start attempt %d failed for hostname: %s", attempt, hostname.c_str());
             if (attempt < 3)
             {
-                delay(1000); // Wait before retry
+                vTaskDelay(pdMS_TO_TICKS(1000)); // Wait before retry
             }
         }
     }
@@ -407,7 +406,7 @@ void WiFiManager::restartmDNS()
 {
     ESPLogger::info("Restarting mDNS...");
     MDNS.end();
-    delay(500);
+    vTaskDelay(pdMS_TO_TICKS(500));
     setupmDNS();
 }
 
@@ -485,9 +484,8 @@ void WiFiManager::setupNTP()
             ntpSynced = true;
             return;
         }
-        delay(500);
+        vTaskDelay(pdMS_TO_TICKS(500));
         attempts++;
-        yield(); // Allow other tasks to run during sync
     }
 
     ESPLogger::warn("⚠️ NTP synchronization timeout after 10 seconds - using system time");

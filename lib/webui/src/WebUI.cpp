@@ -1,7 +1,10 @@
 #include "WebUI.h"
+#include "ModbusClient.h"
 #include <ESPLogger.h>
 #include "constants.h"
 #include <Update.h>
+#include <LittleFS.h>
+#include <ArduinoJson.h>
 
 // Static log buffer initialization
 WebUI::LogEntry WebUI::logBuffer[LOG_BUFFER_SIZE];
@@ -10,8 +13,8 @@ int WebUI::logBufferCount = 0;
 unsigned long WebUI::logStartTime = 0;
 WebUI *WebUI::instance = nullptr;
 
-WebUI::WebUI(Config &config, WiFiManager &wifiManager)
-    : config(config), wifiManager(wifiManager), server(80), wsServer(81), running(false),
+WebUI::WebUI(Config &config, WiFiManager &wifiManager, ModbusClient &modbusClient)
+    : config(config), wifiManager(wifiManager), modbusClient(modbusClient), server(80), wsServer(81), running(false),
       connectedClients(0), lastClientCleanup(0)
 {
     instance = this;
@@ -46,6 +49,11 @@ bool WebUI::begin(uint16_t port)
     logStartTime = millis();
     ESPLogger::setLogCallback(logCallback);
 
+    // Generate CSRF token for this boot. Token lifetime = uptime; any open
+    // browser tab from a previous boot will get a 403 on POST and need to reload.
+    csrfToken = generateCSRFToken();
+    ESPLogger::info("CSRF token generated for this session (32 chars)");
+
     // Setup WebSocket server on port 81
     ESPLogger::info("Initializing WebSocket server on port 81...");
     wsServer.onEvent(onWebSocketEventStatic);
@@ -71,11 +79,17 @@ bool WebUI::begin(uint16_t port)
               { handleLogConfig(); });
     server.on("/api/status", HTTP_GET, [this]()
               { handleAPIStatus(); });
-    server.on("/reboot", HTTP_GET, [this]()
+    server.on("/diagnostics", HTTP_GET, [this]()
+              { handleDiagnostics(); });
+    server.on("/api/diagnostics", HTTP_POST, [this]()
+              { handleDiagnosticsAPI(); });
+    // Destructive endpoints are POST-only and CSRF-validated.
+    // The handlers themselves call validateCSRFToken() and 403 on mismatch.
+    server.on("/reboot", HTTP_POST, [this]()
               { handleReboot(); });
-    server.on("/restart_mdns", HTTP_GET, [this]()
+    server.on("/restart_mdns", HTTP_POST, [this]()
               { handleRestartmDNS(); });
-    server.on("/factory", HTTP_GET, [this]()
+    server.on("/factory", HTTP_POST, [this]()
               { handleFactoryReset(); });
     server.on("/update", HTTP_GET, [this]()
               { handleOTAForm(); });
@@ -173,6 +187,12 @@ void WebUI::handleRoot()
 
 void WebUI::handleSave()
 {
+    if (!validateCSRFToken())
+    {
+        server.send(403, "text/plain", "CSRF token missing or invalid. Reload the form and try again.");
+        return;
+    }
+
     if (!validateForm())
     {
         return;
@@ -271,6 +291,11 @@ void WebUI::handleStatus()
 
 void WebUI::handleReboot()
 {
+    if (!validateCSRFToken())
+    {
+        server.send(403, "text/plain", "CSRF token missing or invalid.");
+        return;
+    }
     sendSuccessWithRedirect(
         "Device is rebooting...",
         getRedirectUrl("/"),
@@ -282,6 +307,11 @@ void WebUI::handleReboot()
 
 void WebUI::handleFactoryReset()
 {
+    if (!validateCSRFToken())
+    {
+        server.send(403, "text/plain", "CSRF token missing or invalid.");
+        return;
+    }
     if (config.factoryReset())
     {
         // After factory reset, device will return to AP mode
@@ -301,6 +331,11 @@ void WebUI::handleFactoryReset()
 
 void WebUI::handleRestartmDNS()
 {
+    if (!validateCSRFToken())
+    {
+        server.send(403, "text/plain", "CSRF token missing or invalid.");
+        return;
+    }
     if (wifiManager.isAPMode())
     {
         sendError("mDNS is not available in AP mode. Connect to WiFi first.");
@@ -643,6 +678,21 @@ void WebUI::handleOTAForm()
 
 void WebUI::handleOTAUpload()
 {
+    // KNOWN ISSUE: CSRF validation here is post-upload — by this point the
+    // upload chunk handler has already called Update.end(true), staging the
+    // new firmware. A CSRF attacker can therefore still flash the device.
+    // Closing this gap requires moving the upload-chunk handler into a method
+    // that can refuse Update.begin() if CSRF is invalid; that's a refactor
+    // for a separate change. For now we at least block the *reboot* from
+    // happening, which gives the legitimate user a chance to react if the
+    // upload was triggered without their consent.
+    if (!validateCSRFToken())
+    {
+        ESPLogger::error("OTA: CSRF validation failed on upload completion");
+        server.send(403, "text/plain", "CSRF token missing or invalid. Firmware may have been staged but reboot is blocked.");
+        return;
+    }
+
     if (Update.hasError())
     {
         sendError("OTA Update failed!");
@@ -722,15 +772,16 @@ String WebUI::generateConfigForm()
     {
         html += "<div class='alert alert-warning'>";
         html += "📡 <strong>Setup Mode Active</strong><br>";
-        html += "You are connected to the device's setup network: <strong>" + wifiManager.getSSID() + "</strong><br>";
+        html += "You are connected to the device's setup network: <strong>" + escapeHtml(wifiManager.getSSID()) + "</strong><br>";
         html += "Configure WiFi settings below to connect the device to your network.<br>";
-        html += "Once connected, you can access the device at <strong>http://" + wifiManager.getHostname() + ".local</strong>";
+        html += "Once connected, you can access the device at <strong>http://" + escapeHtml(wifiManager.getHostname()) + ".local</strong>";
         html += "</div>";
     }
 
     html += "<div class='card'>";
     html += "<div class='card-header'>⚙️ Device Configuration</div>";
     html += "<form method='POST' action='/save' onsubmit='return validateForm()'>";
+    html += csrfHiddenInput();
 
     // WiFi Configuration
     html += "<fieldset><legend>WiFi Settings</legend>";
@@ -803,19 +854,30 @@ String WebUI::generateConfigForm()
     html += "</div>";
     html += "</form>";
 
-    // Quick actions
+    // Quick actions — destructive routes are POST + CSRF protected.
+    // Each is its own <form> because GET-based clicks (img-tag CSRF) used
+    // to be enough to wipe the device. confirm() runs in onsubmit so a
+    // misclick can be cancelled.
     html += "<div class='card' style='margin-top:1rem;'>";
     html += "<div class='card-header'>🔧 Quick Actions</div>";
     html += "<div class='button-group'>";
-    html += "<button type='button' class='btn-warning' onclick='location.href=\"/reboot\"'>🔄 Reboot Device</button>";
-    html += "<button type='button' class='btn-danger' onclick='confirmFactory()'>🏭 Factory Reset</button>";
+
+    html += confirmActionForm("/reboot",
+                              "🔄 Reboot Device",
+                              "Reboot the device now?",
+                              "btn-warning");
+    html += confirmActionForm("/factory",
+                              "🏭 Factory Reset",
+                              "⚠️ This will erase ALL settings and restart the device. Continue?",
+                              "btn-danger");
     html += "</div>";
     html += "</div>";
 
     html += "</div>"; // Close card
     html += "</div>"; // Close container
 
-    // JavaScript for form validation and confirmations
+    // JavaScript for form validation only — confirmations live in the
+    // onsubmit handlers of confirmActionForm().
     html += "<script>";
     html += "function validateForm(){";
     html += "var ssid=document.querySelector('input[name=\"wifi_ssid\"]').value;";
@@ -823,11 +885,6 @@ String WebUI::generateConfigForm()
     html += "if(!ssid.trim()){alert('WiFi SSID is required');return false;}";
     html += "if(!broker.trim()){alert('MQTT Broker is required');return false;}";
     html += "return true;";
-    html += "}";
-    html += "function confirmFactory(){";
-    html += "if(confirm('⚠️ Warning: This will erase ALL settings and restart the device. Continue?')){";
-    html += "location.href='/factory';";
-    html += "}";
     html += "}";
     html += "</script>";
 
@@ -866,18 +923,23 @@ String WebUI::generateStatusPage()
 
     html += "</div>";
 
-    // Network details
+    // Network details — all values that originate from config or the WiFi
+    // stack are HTML-escaped because an SSID, hostname, or device-model name
+    // can contain attacker-controlled bytes (esp. via the captive-portal
+    // setup step where the user types whatever).
     html += "<div style='margin-top:1rem;font-size:0.875rem;color:var(--text-light)'>";
-    html += "<div><strong>SSID:</strong> " + wifiManager.getSSID() + "</div>";
-    html += "<div><strong>IP:</strong> " + wifiManager.getIPAddress() + "</div>";
+    html += "<div><strong>SSID:</strong> " + escapeHtml(wifiManager.getSSID()) + "</div>";
+    html += "<div><strong>IP:</strong> " + escapeHtml(wifiManager.getIPAddress()) + "</div>";
     if (!wifiManager.isAPMode())
     {
-        html += "<div><strong>Hostname:</strong> " + wifiManager.getNetworkHostname() + "</div>";
+        html += "<div><strong>Hostname:</strong> " + escapeHtml(wifiManager.getNetworkHostname()) + "</div>";
         String mdnsStatus = wifiManager.ismDNSActive() ? "✅ Active" : "❌ Inactive";
         html += "<div><strong>mDNS Status:</strong> " + mdnsStatus + "</div>";
-        String mdnsUrl = "http://" + wifiManager.getHostname() + ".local";
-        html += "<div><strong>mDNS Access:</strong> <a href='" + mdnsUrl + "' target='_blank'>" + wifiManager.getHostname() + ".local</a></div>";
-        html += "<div><strong>Direct IP:</strong> <a href='http://" + wifiManager.getIPAddress() + "' target='_blank'>" + wifiManager.getIPAddress() + "</a></div>";
+        String hostname = wifiManager.getHostname();
+        String mdnsUrl = "http://" + hostname + ".local";
+        html += "<div><strong>mDNS Access:</strong> <a href='" + escapeHtml(mdnsUrl) + "' target='_blank'>" + escapeHtml(hostname) + ".local</a></div>";
+        String ip = wifiManager.getIPAddress();
+        html += "<div><strong>Direct IP:</strong> <a href='http://" + escapeHtml(ip) + "' target='_blank'>" + escapeHtml(ip) + "</a></div>";
     }
     html += "</div>";
     html += "</div>";
@@ -887,20 +949,20 @@ String WebUI::generateStatusPage()
     html += "<div class='card-header'>🔧 Device Information</div>";
     html += "<div style='margin-bottom:1rem'>";
     html += "<div class='status-card'>";
-    html += "<div class='status-value'>" + wifiManager.getDeviceId() + "</div>";
+    html += "<div class='status-value'>" + escapeHtml(wifiManager.getDeviceId()) + "</div>";
     html += "<div class='status-label'>Device ID</div>";
     html += "</div>";
     html += "</div>";
 
     html += "<div style='font-size:0.875rem;color:var(--text-light)'>";
-    html += "<div><strong>MAC:</strong> " + wifiManager.getMACAddress() + "</div>";
-    html += "<div><strong>Model:</strong> " + config.getString("device_model") + "</div>";
-    html += "<div><strong>Version:</strong> " + String(FIRMWARE_VERSION) + "</div>";
-    html += "<div><strong>Build Mode:</strong> " + String(BUILD_MODE) + "</div>";
-    html += "<div><strong>Git:</strong> " + String(GIT_HASH) + " (" + String(GIT_BRANCH) + ")</div>";
-    html += "<div><strong>Built:</strong> " + String(BUILD_TIMESTAMP) + "</div>";
+    html += "<div><strong>MAC:</strong> " + escapeHtml(wifiManager.getMACAddress()) + "</div>";
+    html += "<div><strong>Model:</strong> " + escapeHtml(config.getString("device_model")) + "</div>";
+    html += "<div><strong>Version:</strong> " + escapeHtml(String(FIRMWARE_VERSION)) + "</div>";
+    html += "<div><strong>Build Mode:</strong> " + escapeHtml(String(BUILD_MODE)) + "</div>";
+    html += "<div><strong>Git:</strong> " + escapeHtml(String(GIT_HASH)) + " (" + escapeHtml(String(GIT_BRANCH)) + ")</div>";
+    html += "<div><strong>Built:</strong> " + escapeHtml(String(BUILD_TIMESTAMP)) + "</div>";
     html += "<div><strong>Poll Interval:</strong> " + String(config.getInt("poll_interval_sec")) + "s</div>";
-    html += "<div><strong>Log Level:</strong> " + config.getString("log_level", "info") + "</div>";
+    html += "<div><strong>Log Level:</strong> " + escapeHtml(config.getString("log_level", "info")) + "</div>";
     html += "</div>";
     html += "</div>";
 
@@ -941,29 +1003,35 @@ String WebUI::generateStatusPage()
 
     html += "</div>"; // Close grid
 
-    // Actions
+    // Actions — destructive routes are POST + CSRF protected.
     html += "<div class='card'>";
     html += "<div class='card-header'>🔧 Device Actions</div>";
     html += "<div class='button-group'>";
     html += "<button class='btn-secondary' onclick='location.reload()'>🔄 Refresh</button>";
+
+    // Add diagnostics link if enabled
     if (!wifiManager.isAPMode())
     {
-        html += "<button class='btn-primary' onclick='location.href=\"/restart_mdns\"'>📡 Restart mDNS</button>";
+        html += confirmActionForm("/restart_mdns",
+                                  "📡 Restart mDNS",
+                                  "Restart the mDNS responder?",
+                                  "btn-primary");
     }
-    html += "<button class='btn-warning' onclick='location.href=\"/reboot\"'>🔄 Reboot</button>";
-    html += "<button class='btn-danger' onclick='confirmReset()'>🏭 Factory Reset</button>";
+    html += confirmActionForm("/reboot",
+                              "🔄 Reboot",
+                              "Reboot the device now?",
+                              "btn-warning");
+    html += confirmActionForm("/factory",
+                              "🏭 Factory Reset",
+                              "⚠️ This will erase ALL settings and restart the device. Continue?",
+                              "btn-danger");
     html += "</div>";
     html += "</div>";
 
     html += "</div>"; // Close container
 
-    // Add auto-refresh and confirmation script
+    // Add auto-refresh
     html += "<script>";
-    html += "function confirmReset(){";
-    html += "if(confirm('⚠️ Warning: This will erase ALL settings and restart the device. Continue?')){";
-    html += "location.href='/factory';";
-    html += "}";
-    html += "}";
     html += "setTimeout(function(){location.reload();}, 30000);"; // Auto-refresh every 30 seconds
     html += "</script>";
 
@@ -982,6 +1050,11 @@ String WebUI::generateOTAForm()
     html += "</div>";
 
     html += "<form method='POST' action='/update' enctype='multipart/form-data' onsubmit='return validateUpload()'>";
+    // CSRF token must come BEFORE the file input so the multipart parser
+    // populates server.arg("_csrf") before the firmware bytes start streaming.
+    // See KNOWN ISSUE in handleOTAUpload(): we currently validate post-upload,
+    // which is too late to prevent flash damage from a CSRF attacker.
+    html += csrfHiddenInput();
     html += "<div class='form-group'>";
     html += "<label for='firmware'>📁 Select Firmware File (.bin):</label>";
     html += "<input type='file' name='firmware' accept='.bin' required style='padding:0.5rem;'>";
@@ -1037,10 +1110,12 @@ String WebUI::getHTMLHeader(const String &title)
     String configClass = (title == "Configuration") ? String("active") : String("");
     String statusClass = (title == "Status") ? String("active") : String("");
     String consoleClass = (title == "Console") ? String("active") : String("");
+    String diagnosticsClass = (title == "Diagnostics") ? String("active") : String("");
     String updateClass = (title == "Firmware Update") ? String("active") : String("");
     html += "<a href='/' class='" + configClass + "'>⚙️ Config</a>";
     html += "<a href='/status' class='" + statusClass + "'>📊 Status</a>";
     html += "<a href='/console' class='" + consoleClass + "'>🖥️ Console</a>";
+    html += "<a href='/diagnostics' class='" + diagnosticsClass + "'>🔬 Diagnostics</a>";
     html += "<a href='/update' class='" + updateClass + "'>🔄 Update</a>";
     html += "</nav>";
     html += "</div>";
@@ -1054,10 +1129,11 @@ String WebUI::getHTMLFooter()
 {
     String html = "</main>";
     html += "<footer style='text-align:center;padding:2rem;color:var(--text-light);font-size:0.875rem'>";
-    html += "Modbus Bridge " + String(FIRMWARE_VERSION) + " • Device ID: " + wifiManager.getDeviceId();
+    html += "Modbus Bridge " + escapeHtml(String(FIRMWARE_VERSION)) + " • Device ID: " + escapeHtml(wifiManager.getDeviceId());
     if (!wifiManager.isAPMode())
     {
-        html += " • <a href='http://" + wifiManager.getHostname() + ".local' style='color:var(--primary)'>http://" + wifiManager.getHostname() + ".local</a>";
+        String h = escapeHtml(wifiManager.getHostname());
+        html += " • <a href='http://" + h + ".local' style='color:var(--primary)'>http://" + h + ".local</a>";
     }
     html += "</footer>";
     html += "</body></html>";
@@ -1127,15 +1203,19 @@ String WebUI::getCSS()
 
 String WebUI::selectOption(const String &value, const String &current, const String &label)
 {
+    // value/label may originate from config; escape both. `current` only used for comparison.
     String selected = (value == current) ? " selected" : "";
-    return "<option value='" + value + "'" + selected + ">" + label + "</option>";
+    return "<option value='" + escapeHtml(value) + "'" + selected + ">" + escapeHtml(label) + "</option>";
 }
 
 String WebUI::textInput(const String &name, const String &value, const String &label, const String &type)
 {
+    // `value` is config-controlled and could contain attacker-stored content -> escape.
+    // `name`, `type`, `label` are compile-time constants from our own code, but escape
+    // anyway in case future callers pass dynamic values.
     String html = "<div class='form-group'>";
-    html += "<label for='" + name + "'>" + label + ":</label>";
-    html += "<input type='" + type + "' name='" + name + "' id='" + name + "' value='" + value + "'>";
+    html += "<label for='" + escapeHtml(name) + "'>" + escapeHtml(label) + ":</label>";
+    html += "<input type='" + escapeHtml(type) + "' name='" + escapeHtml(name) + "' id='" + escapeHtml(name) + "' value='" + escapeHtml(value) + "'>";
     html += "</div>";
     return html;
 }
@@ -1144,11 +1224,11 @@ String WebUI::checkboxInput(const String &name, bool checked, const String &labe
 {
     String html = "<div class='form-group'>";
     html += "<div class='checkbox-group'>";
-    html += "<input type='checkbox' name='" + name + "' id='" + name + "'";
+    html += "<input type='checkbox' name='" + escapeHtml(name) + "' id='" + escapeHtml(name) + "'";
     if (checked)
         html += " checked";
     html += ">";
-    html += "<label for='" + name + "'>" + label + "</label>";
+    html += "<label for='" + escapeHtml(name) + "'>" + escapeHtml(label) + "</label>";
     html += "</div>";
     html += "</div>";
     return html;
@@ -1156,9 +1236,11 @@ String WebUI::checkboxInput(const String &name, bool checked, const String &labe
 
 String WebUI::selectInput(const String &name, const String &current, const String &options, const String &label)
 {
+    // NOTE: `options` is the raw HTML <option> list pre-built by selectOption() (which
+    // already escapes). Do NOT re-escape it — it's already safe.
     String html = "<div class='form-group'>";
-    html += "<label for='" + name + "'>" + label + ":</label>";
-    html += "<select name='" + name + "' id='" + name + "'>" + options + "</select>";
+    html += "<label for='" + escapeHtml(name) + "'>" + escapeHtml(label) + ":</label>";
+    html += "<select name='" + escapeHtml(name) + "' id='" + escapeHtml(name) + "'>" + options + "</select>";
     html += "</div>";
     return html;
 }
@@ -1178,12 +1260,92 @@ bool WebUI::validateForm()
     return true;
 }
 
+// --- Security helpers (XSS, CSRF) ---
+
+String WebUI::escapeHtml(const String &s)
+{
+    // Escapes the five HTML metacharacters. Sufficient for inlining values
+    // into text nodes and double-quoted attribute values. Do NOT use this for
+    // values inlined into JavaScript context, URLs, or single-quoted attributes
+    // without re-checking — those need their own escapers.
+    String out;
+    out.reserve(s.length() + 8);
+    for (size_t i = 0; i < s.length(); ++i)
+    {
+        char c = s[i];
+        switch (c)
+        {
+        case '&':  out += "&amp;";  break;
+        case '<':  out += "&lt;";   break;
+        case '>':  out += "&gt;";   break;
+        case '"':  out += "&quot;"; break;
+        case '\'': out += "&#39;";  break;
+        default:   out += c;        break;
+        }
+    }
+    return out;
+}
+
+String WebUI::generateCSRFToken()
+{
+    // 16 bytes of randomness, hex-encoded -> 32 char token. esp_random is
+    // a hardware RNG on ESP32 and is more than enough for CSRF.
+    char buf[33];
+    for (int i = 0; i < 16; ++i)
+    {
+        uint8_t b = (uint8_t)(esp_random() & 0xFF);
+        sprintf(&buf[i * 2], "%02x", b);
+    }
+    buf[32] = '\0';
+    return String(buf);
+}
+
+bool WebUI::validateCSRFToken()
+{
+    if (csrfToken.isEmpty())
+    {
+        ESPLogger::error("CSRF: no token generated yet — refusing POST");
+        return false;
+    }
+    if (!server.hasArg("_csrf"))
+    {
+        ESPLogger::warn("CSRF: missing _csrf param from %s", server.client().remoteIP().toString().c_str());
+        return false;
+    }
+    String submitted = server.arg("_csrf");
+    if (submitted != csrfToken)
+    {
+        ESPLogger::warn("CSRF: token mismatch from %s", server.client().remoteIP().toString().c_str());
+        return false;
+    }
+    return true;
+}
+
+String WebUI::csrfHiddenInput() const
+{
+    // csrfToken is hex, no escaping needed, but be defensive anyway.
+    return "<input type='hidden' name='_csrf' value='" + escapeHtml(csrfToken) + "'>";
+}
+
+String WebUI::confirmActionForm(const String &action, const String &buttonLabel,
+                                const String &message, const String &btnClass) const
+{
+    String html = "<form method='POST' action='" + escapeHtml(action) + "' "
+                  "onsubmit=\"return confirm('" + escapeHtml(message) + "');\" "
+                  "style='display:inline'>";
+    html += csrfHiddenInput();
+    html += "<button type='submit' class='" + escapeHtml(btnClass) + "'>"
+            + escapeHtml(buttonLabel) + "</button>";
+    html += "</form>";
+    return html;
+}
+
 void WebUI::sendError(const String &message)
 {
     String html = getHTMLHeader("Error");
     html += "<div class='container'>";
     html += "<h2>Error</h2>";
-    html += "<div class='warning'>" + message + "</div>";
+    html += "<div class='warning'>" + escapeHtml(message) + "</div>";
     html += "<button onclick='history.back()'>Go Back</button>";
     html += "</div>";
     html += getHTMLFooter();
@@ -1196,7 +1358,7 @@ void WebUI::sendSuccess(const String &message)
     html += "<div class='container'>";
     html += "<h2>Success</h2>";
     html += "<div style='background:#d4edda;border:1px solid #c3e6cb;color:#155724;padding:10px;border-radius:4px;margin:15px 0'>";
-    html += message + "</div>";
+    html += escapeHtml(message) + "</div>";
     html += "</div>";
     html += getHTMLFooter();
     server.send(200, "text/html", html);
@@ -1279,10 +1441,52 @@ void WebUI::sendSuccessWithRedirect(const String &message, const String &redirec
 String WebUI::generateDeviceOptions(const String &current)
 {
     String options = "";
+
+    // Add built-in devices
     for (size_t i = 0; i < SUPPORTED_DEVICES_COUNT; i++)
     {
         options += selectOption(SUPPORTED_DEVICES[i].model, current, SUPPORTED_DEVICES[i].displayName);
     }
+
+    // Add custom JSON devices from /devices/ directory
+    if (LittleFS.begin())
+    {
+        if (LittleFS.exists("/devices"))
+        {
+            File dir = LittleFS.open("/devices");
+            if (dir && dir.isDirectory())
+            {
+                File file = dir.openNextFile();
+                while (file)
+                {
+                    String filename = String(file.name());
+                    if (filename.endsWith(".json") && !file.isDirectory())
+                    {
+                        // Try to parse JSON to get device name
+                        String displayName = filename; // Fallback to filename
+                        JsonDocument doc;
+                        DeserializationError error = deserializeJson(doc, file);
+                        if (!error && doc.containsKey("name"))
+                        {
+                            displayName = doc["name"].as<String>() + " (Custom)";
+                        }
+                        else
+                        {
+                            displayName = filename + " (Custom)";
+                        }
+
+                        // Option value is "json:filename.json"
+                        String value = "json:" + filename;
+                        options += selectOption(value, current, displayName);
+                    }
+                    file.close();
+                    file = dir.openNextFile();
+                }
+                dir.close();
+            }
+        }
+    }
+
     return options;
 }
 
