@@ -1102,11 +1102,15 @@ String WebUI::getHTMLHeader(const String &title)
     html += getCSS();
     html += "</head><body>";
 
-    // Header with navigation
+    // Header with navigation. Hamburger toggle is hidden on desktop (>=769px)
+    // and shown as a tap target on mobile via the @media block in getCSS().
     html += "<header class='header'>";
     html += "<div class='container'>";
     html += "<div class='logo'>Modbus Bridge</div>";
-    html += "<nav class='nav'>";
+    html += "<button class='nav-toggle' type='button' aria-label='Toggle navigation' "
+            "aria-controls='primary-nav' aria-expanded='false' onclick='toggleNav(this)'>"
+            "<span class='nav-toggle-icon' aria-hidden='true'>&#9776;</span></button>";
+    html += "<nav class='nav' id='primary-nav'>";
     String configClass = (title == "Configuration") ? String("active") : String("");
     String statusClass = (title == "Status") ? String("active") : String("");
     String consoleClass = (title == "Console") ? String("active") : String("");
@@ -1120,6 +1124,23 @@ String WebUI::getHTMLHeader(const String &title)
     html += "</nav>";
     html += "</div>";
     html += "</header>";
+    // Mobile nav toggle. Inline so every page gets it without a separate fetch.
+    html += "<script>"
+            "function toggleNav(b){"
+              "var n=document.getElementById('primary-nav');"
+              "var open=n.classList.toggle('open');"
+              "b.setAttribute('aria-expanded',open?'true':'false');"
+            "}"
+            "document.addEventListener('click',function(e){"
+              "var n=document.getElementById('primary-nav');"
+              "var b=document.querySelector('.nav-toggle');"
+              "if(!n||!b||!n.classList.contains('open'))return;"
+              "if(!n.contains(e.target)&&!b.contains(e.target)){"
+                "n.classList.remove('open');"
+                "b.setAttribute('aria-expanded','false');"
+              "}"
+            "});"
+            "</script>";
     html += "<main class='main'>";
 
     return html;
@@ -1152,6 +1173,9 @@ String WebUI::getCSS()
            ".nav{display:flex;gap:1rem}"
            ".nav a{color:white;text-decoration:none;padding:0.5rem 1rem;border-radius:0.375rem;transition:background 0.2s}"
            ".nav a:hover,.nav a.active{background:rgba(255,255,255,0.1)}"
+           ".nav-toggle{display:none;background:transparent;border:0;color:white;cursor:pointer;padding:0.5rem 0.75rem;border-radius:0.375rem;line-height:1;min-width:44px;min-height:44px}"
+           ".nav-toggle:hover{background:rgba(255,255,255,0.1)}"
+           ".nav-toggle-icon{font-size:1.5rem;display:block;line-height:1}"
            ".container{max-width:1200px;margin:0 auto;padding:0 1rem}"
            ".main{padding:2rem 0}"
            ".card{background:var(--surface);border-radius:0.5rem;box-shadow:0 1px 3px rgba(0,0,0,0.1);padding:1.5rem;margin-bottom:1.5rem}"
@@ -1170,7 +1194,7 @@ String WebUI::getCSS()
            "legend{padding:0 0.5rem;font-weight:600;color:var(--text)}"
            ".form-group{margin:1rem 0}"
            "label{display:block;margin-bottom:0.5rem;font-weight:500;color:var(--text)}"
-           "input,select{width:100%;padding:0.75rem;border:1px solid var(--border);border-radius:0.375rem;font-size:0.875rem;transition:border-color 0.2s,box-shadow 0.2s}"
+           "input,select,textarea{width:100%;padding:0.75rem;border:1px solid var(--border);border-radius:0.375rem;font-size:0.875rem;transition:border-color 0.2s,box-shadow 0.2s}"
            "input:focus,select:focus{outline:none;border-color:var(--border-focus);box-shadow:0 0 0 3px rgba(59,130,246,0.1)}"
            "input[type=checkbox]{width:auto;margin-right:0.5rem}"
            ".checkbox-group{display:flex;align-items:center;gap:0.5rem}"
@@ -1197,7 +1221,28 @@ String WebUI::getCSS()
            ".text-center{text-align:center}"
            ".mt-4{margin-top:1rem}"
            ".mb-4{margin-bottom:1rem}"
-           "@media(max-width:768px){.container{padding:0 0.5rem}.grid-2,.grid-3{grid-template-columns:1fr}.button-group{flex-direction:column}.nav{flex-direction:column;gap:0.5rem}}"
+           "@media(max-width:768px){"
+             ".container{padding:0 0.75rem}"
+             ".main{padding:1rem 0}"
+             ".grid-2,.grid-3{grid-template-columns:1fr}"
+             ".card{padding:1rem;margin-bottom:1rem}"
+             // Header layout: logo + hamburger on row 1, drawer drops below as row 2.
+             ".header .container{flex-wrap:wrap;align-items:center;gap:0.5rem;padding:0 0.75rem}"
+             ".nav-toggle{display:inline-flex;align-items:center;justify-content:center}"
+             // Drawer is hidden by default; .open (set by toggleNav JS) reveals it.
+             // flex-basis:100% forces it onto its own row inside the wrapping flex.
+             ".nav{display:none;flex-basis:100%;flex-direction:column;gap:0.25rem;"
+                  "padding-top:0.5rem;border-top:1px solid rgba(255,255,255,0.15)}"
+             ".nav.open{display:flex}"
+             ".nav a{flex:none;width:100%;text-align:left;padding:0.75rem 1rem;font-size:1rem;border-radius:0.375rem}"
+             ".button-group{flex-direction:column;gap:0.5rem}"
+             ".button-group button{width:100%;justify-content:center}"
+             ".status-grid{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}"
+             ".status-value{font-size:1.25rem}"
+             // 16px font-size on inputs prevents iOS Safari auto-zoom on focus.
+             // Scoped to mobile so desktop keeps the denser 0.875rem.
+             "input,select,textarea{font-size:16px}"
+           "}"
            "</style>";
 }
 

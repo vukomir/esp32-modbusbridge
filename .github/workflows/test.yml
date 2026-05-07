@@ -32,7 +32,8 @@ jobs:
           - test_solplanet_asw
           - test_hiking_dds238
           - test_poller
-    
+          - test_generic_device
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4

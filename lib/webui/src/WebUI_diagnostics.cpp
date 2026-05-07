@@ -1,7 +1,11 @@
 #include "WebUI.h"
 #include "ModbusClient.h"
+#include "GenericModbusDevice.h"
 #include <ESPLogger.h>
 #include <ArduinoJson.h>
+
+// Filename validator lives on GenericModbusDevice (single source of truth,
+// also called by InverterFactory when loading json:<filename> from config).
 
 void WebUI::handleDiagnostics()
 {
@@ -23,22 +27,35 @@ void WebUI::handleDiagnostics()
     String html = getHTMLHeader("Modbus Diagnostics");
     html += R"(
 <style>
-.diag-section{border:1px solid #ddd;border-radius:8px;padding:15px;margin:15px 0;background:#f9f9f9;}
+.diag-section{border:1px solid #ddd;border-radius:8px;padding:1rem;margin:1rem 0;background:#f9f9f9;}
 .diag-section h3{margin-top:0;color:#333;}
-.form-group{margin:10px 0;}
-.form-group label{display:inline-block;width:150px;font-weight:bold;}
-.form-group input,.form-group select{width:200px;padding:5px;border:1px solid #ccc;border-radius:4px;}
-.btn-diag{padding:10px 20px;margin:5px;border:none;border-radius:4px;cursor:pointer;font-size:14px;}
+/* Mobile-first: stacked label + full-width control. Desktop sees the
+   inline-block layout via the @media block below. */
+.form-group{margin:0.75rem 0;}
+.form-group label{display:block;font-weight:bold;margin-bottom:0.25rem;}
+.form-group input,.form-group select{width:100%;padding:0.5rem;border:1px solid #ccc;border-radius:4px;font-size:0.875rem;}
+.diag-num-narrow{max-width:6rem;display:inline-block;}
+.btn-diag{padding:0.625rem 1rem;margin:0.25rem 0.25rem 0.25rem 0;border:none;border-radius:4px;cursor:pointer;font-size:0.875rem;}
 .btn-primary{background:#007bff;color:white;}
+.btn-secondary{background:#6b7280;color:white;}
 .btn-warning{background:#ffc107;color:#000;}
 .btn-danger{background:#dc3545;color:white;}
-.result-box{margin:10px 0;padding:10px;background:#fff;border:1px solid #ddd;border-radius:4px;font-family:monospace;font-size:12px;max-height:400px;overflow-y:auto;}
+.result-box{margin:0.75rem 0;padding:0.75rem;background:#fff;border:1px solid #ddd;border-radius:4px;font-family:monospace;font-size:12px;max-height:400px;overflow-x:auto;overflow-y:auto;word-break:break-word;}
 .success{color:green;}
 .error{color:red;}
 .frame-log{font-size:11px;}
 .frame-tx{color:#0066cc;}
 .frame-rx{color:#009900;}
 .frame-err{color:#cc0000;}
+@media(min-width:640px){
+  .form-group label{display:inline-block;width:150px;margin-bottom:0;vertical-align:middle;}
+  .form-group input,.form-group select{width:auto;min-width:200px;}
+}
+@media(max-width:768px){
+  .btn-diag{display:block;width:100%;margin:0.25rem 0;}
+  /* iOS auto-zoom avoidance — 16px only on mobile, desktop keeps 0.875rem density. */
+  .form-group input,.form-group select,.diag-num-narrow{font-size:16px;}
+}
 </style>
 
 <div class='container'>
@@ -80,9 +97,9 @@ void WebUI::handleDiagnostics()
 <p>Find which slave addresses respond (tests register 0x0000)</p>
 <div class='form-group'>
 <label>Address Range:</label>
-<input type='number' id='scan_start' value='1' min='1' max='247' style='width:80px;'>
+<input type='number' id='scan_start' value='1' min='1' max='247' class='diag-num-narrow'>
 to
-<input type='number' id='scan_end' value='10' min='1' max='247' style='width:80px;'>
+<input type='number' id='scan_end' value='10' min='1' max='247' class='diag-num-narrow'>
 </div>
 <button class='btn-diag btn-primary' onclick='scanSlaves()'>🔍 Scan Slave Addresses</button>
 <div id='slave_result' class='result-box' style='display:none;'></div>
@@ -457,18 +474,35 @@ void WebUI::handleDiagnosticsAPI()
     }
     else if (action == "upload_json")
     {
+        // Extract what we need from the envelope, then doc.clear() to release
+        // the envelope's heap pool before validateJSON parses the device JSON
+        // again. Otherwise a 16 KB upload holds three simultaneous live copies
+        // (envelope doc, content String, validateJSON's inner doc) and peaks
+        // ~50-70 KB heap on a board with ~100 KB free after WiFi/MQTT.
         String filename = doc["filename"].as<String>();
-        String content = doc["content"].as<String>();
+        String content  = doc["content"].as<String>();
+        doc.clear();
 
-        // Validate filename
-        if (!filename.endsWith(".json"))
+        if (!GenericModbusDevice::isSafeDeviceFilename(filename))
         {
-            html = "<span class='error'>✗ File must be .json</span>";
+            html = "<span class='error'>✗ Invalid filename: must be a plain .json filename, "
+                   "no slashes, no '..', no leading dot</span>";
+        }
+        else if (content.length() > GenericModbusDevice::MAX_JSON_FILE_BYTES)
+        {
+            html = "<span class='error'>✗ File too large: " + String((unsigned)content.length()) +
+                   " bytes (max " + String((unsigned)GenericModbusDevice::MAX_JSON_FILE_BYTES) + ")</span>";
         }
         else
         {
-            // Create /devices directory if it doesn't exist
-            if (!LittleFS.begin())
+            // Validate JSON content (schema, registers, groups, bits, names, sizes)
+            // before writing — surface errors in the HTTP response, not just the log.
+            String validateErr;
+            if (!GenericModbusDevice::validateJSON(content, validateErr))
+            {
+                html = "<span class='error'>✗ Invalid device JSON: " + validateErr + "</span>";
+            }
+            else if (!LittleFS.begin())
             {
                 html = "<span class='error'>✗ LittleFS mount failed</span>";
             }
@@ -479,7 +513,6 @@ void WebUI::handleDiagnosticsAPI()
                     LittleFS.mkdir("/devices");
                 }
 
-                // Save file
                 String filepath = "/devices/" + filename;
                 File file = LittleFS.open(filepath, "w");
                 if (file)
@@ -548,7 +581,11 @@ void WebUI::handleDiagnosticsAPI()
     {
         String filename = doc["filename"].as<String>();
 
-        if (!LittleFS.begin())
+        if (!GenericModbusDevice::isSafeDeviceFilename(filename))
+        {
+            html = "<span class='error'>✗ Invalid filename</span>";
+        }
+        else if (!LittleFS.begin())
         {
             html = "<span class='error'>LittleFS mount failed</span>";
         }
