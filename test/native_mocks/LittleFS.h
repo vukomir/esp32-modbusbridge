@@ -9,19 +9,42 @@
 #include <filesystem>
 
 // Mock File class
+//
+// Write-back semantics: when opened in write mode, MockFile holds a pointer
+// to MockLittleFS::files so close()/destructor commits buffered writes back to
+// the parent map. Without this, writes are lost when the value-returned MockFile
+// goes out of scope, which broke any test that did `f = open("w"); f.print(...);
+// f.close();` then expected the content to be readable on a subsequent open.
 class MockFile {
 private:
     std::string content;
     std::string path;
     size_t position;
     bool isOpen;
-    
+    bool isWriting;
+    std::map<std::string, std::string>* writeBackTarget;  // null in read mode
+
+    void commit() {
+        if (isOpen && isWriting && writeBackTarget) {
+            (*writeBackTarget)[path] = content;
+        }
+    }
+
 public:
-    MockFile() : position(0), isOpen(false) {}
-    MockFile(const std::string& p, const std::string& c) : content(c), path(p), position(0), isOpen(true) {}
-    
+    MockFile() : position(0), isOpen(false), isWriting(false), writeBackTarget(nullptr) {}
+    // Read-mode constructor.
+    MockFile(const std::string& p, const std::string& c)
+        : content(c), path(p), position(0), isOpen(true),
+          isWriting(false), writeBackTarget(nullptr) {}
+    // Write-mode constructor (commits to `target` on close/destruction).
+    MockFile(const std::string& p, std::map<std::string, std::string>* target)
+        : content(""), path(p), position(0), isOpen(true),
+          isWriting(true), writeBackTarget(target) {}
+
+    ~MockFile() { commit(); }
+
     operator bool() const { return isOpen; }
-    
+
     size_t write(uint8_t c) {
         if (!isOpen) return 0;
         if (position >= content.size()) {
@@ -30,7 +53,7 @@ public:
         content[position++] = c;
         return 1;
     }
-    
+
     size_t write(const uint8_t* buffer, size_t size) {
         if (!isOpen) return 0;
         for (size_t i = 0; i < size; i++) {
@@ -38,12 +61,21 @@ public:
         }
         return size;
     }
-    
+
+    size_t print(const char* s) {
+        if (!isOpen || !s) return 0;
+        return write((const uint8_t*)s, strlen(s));
+    }
+
+    size_t print(const String& s) {
+        return print(s.c_str());
+    }
+
     int read() {
         if (!isOpen || position >= content.size()) return -1;
         return content[position++];
     }
-    
+
     size_t readBytes(char* buffer, size_t length) {
         if (!isOpen) return 0;
         size_t bytesRead = 0;
@@ -53,20 +85,16 @@ public:
         }
         return bytesRead;
     }
-    
+
     int available() {
         return isOpen ? (content.size() - position) : 0;
     }
-    
-    void flush() {}
-    void close() { isOpen = false; }
-    
+
+    void flush() { commit(); }
+    void close() { commit(); isOpen = false; }
+
     size_t size() { return content.size(); }
     String name() { return String(path.c_str()); }
-    
-    // For updating the mock filesystem
-    void setContent(const std::string& c) { content = c; position = 0; }
-    std::string getContent() const { return content; }
 };
 
 // Mock LittleFS class
@@ -92,13 +120,15 @@ public:
     
     MockFile open(const String& path, const char* mode = "r") {
         if (!mounted) return MockFile();
-        
+
         std::string pathStr = path.c_str();
-        
+
         if (mode && (strcmp(mode, "w") == 0 || strcmp(mode, "w+") == 0)) {
-            // Write mode - create/overwrite file
+            // Write mode: pre-create the entry so existence checks see it,
+            // and pass &files so the file commits its buffered content on
+            // close/destruct.
             files[pathStr] = "";
-            return MockFile(pathStr, "");
+            return MockFile(pathStr, &files);
         } else {
             // Read mode
             auto it = files.find(pathStr);

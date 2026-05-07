@@ -136,8 +136,12 @@ void setup()
     ESPLogger::info("MQTTTask created on Core 0 (4KB stack)");
 
     // Core 0: Modbus polling (I/O intensive, higher priority)
-    xTaskCreatePinnedToCore(pollerTask, "PollerTask", 4096, NULL, 3, &pollerTaskHandle, 0);
-    ESPLogger::info("PollerTask created on Core 0 (4KB stack)");
+    // 6KB stack: 4KB was the original budget for SolplanetASW's 23-register block reads.
+    // GenericModbusDevice can issue up to 125-register block reads with a 250-byte
+    // stack buffer plus deeper call chain (decodeValue, std::vector pushes, String
+    // allocations), so we lift the ceiling to 6KB. RAM cost: +2KB permanently.
+    xTaskCreatePinnedToCore(pollerTask, "PollerTask", 6144, NULL, 3, &pollerTaskHandle, 0);
+    ESPLogger::info("PollerTask created on Core 0 (6KB stack)");
 
     // Core 1: Status reporting (low priority, background)
     xTaskCreatePinnedToCore(statusTask, "StatusTask", 4096, NULL, 1, &statusTaskHandle, 1);
@@ -148,7 +152,8 @@ void setup()
     ESPLogger::info("ButtonTask created on Core 1 (2KB stack)");
 
     ESPLogger::info("All tasks created successfully!");
-    ESPLogger::info("Total stack allocated: 18KB, Final heap: %u bytes", ESP.getFreeHeap());
+    // 6 (web) + 4 (mqtt) + 6 (poller) + 4 (status) + 2 (button) = 22 KB
+    ESPLogger::info("Total stack allocated: 22KB, Final heap: %u bytes", ESP.getFreeHeap());
 }
 
 void loop()

@@ -29,7 +29,7 @@ class ModbusClient
 {
 public:
     explicit ModbusClient(Config &config);
-    ~ModbusClient();
+    virtual ~ModbusClient();
 
     bool begin();
     void end();
@@ -43,8 +43,9 @@ public:
     // Read-only functions (SAFETY: No write functions implemented)
     // These wrap the underlying single-shot read with retry+backoff. See MAX_READ_ATTEMPTS.
     // Set maxAttempts=1 for diagnostics to disable retries (faster, cleaner logs)
-    bool readHoldingRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t count, uint16_t *data, uint8_t maxAttempts = MAX_READ_ATTEMPTS);
-    bool readInputRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t count, uint16_t *data, uint8_t maxAttempts = MAX_READ_ATTEMPTS);
+    // virtual: tests subclass with a programmable stub. Vtable cost is one slot per instance.
+    virtual bool readHoldingRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t count, uint16_t *data, uint8_t maxAttempts = MAX_READ_ATTEMPTS);
+    virtual bool readInputRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t count, uint16_t *data, uint8_t maxAttempts = MAX_READ_ATTEMPTS);
 
     // SAFETY: the only Modbus function codes this client is allowed to emit.
     // Any caller that synthesizes another function code is rejected by buildReadFrame().

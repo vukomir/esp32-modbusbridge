@@ -12,7 +12,17 @@ std::unique_ptr<InverterInterface> InverterFactory::create(const String &model, 
     // Check if this is a JSON-based device (format: "json:filename.json")
     if (model.startsWith("json:"))
     {
-        String jsonFile = "/devices/" + model.substring(5); // Remove "json:" prefix
+        String filename = model.substring(5);
+        // Defense-in-depth: WebUI validates filenames at upload time, but
+        // device_model can be written to config via other paths (factory reset
+        // recovery, manual config edit, future API). Re-validate before we
+        // build a LittleFS path with it. Otherwise "json:../config.json"
+        // would point the device parser at /config.json.
+        if (!GenericModbusDevice::isSafeDeviceFilename(filename))
+        {
+            return nullptr;
+        }
+        String jsonFile = "/devices/" + filename;
         return std::unique_ptr<InverterInterface>(new GenericModbusDevice(modbus, config, jsonFile));
     }
 
