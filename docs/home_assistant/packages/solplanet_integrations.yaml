@@ -1,0 +1,29 @@
+# =============================================================================
+# SolPlanet Inverter — Riemann-sum integrations
+# Convert instantaneous-power template sensors into cumulative kWh suitable
+# for the HA Energy Dashboard. These are needed because the firmware-reported
+# grid_export_total / consumption_today / generation_today_ac counters are
+# not incrementing on this Solplanet model.
+#
+# Method: trapezoidal Riemann sum of the power signal over time.
+# Reset: never — these are total_increasing, monotonic across reboots.
+# =============================================================================
+
+sensor:
+  - platform: integration
+    source: sensor.solplanet_grid_export_power
+    name: "Solplanet Grid Export Energy"
+    unique_id: sp_grid_export_energy
+    unit_prefix: k
+    unit_time: h
+    method: trapezoidal
+    round: 3
+
+  - platform: integration
+    source: sensor.solplanet_grid_import_power
+    name: "Solplanet Grid Import Energy"
+    unique_id: sp_grid_import_energy
+    unit_prefix: k
+    unit_time: h
+    method: trapezoidal
+    round: 3
