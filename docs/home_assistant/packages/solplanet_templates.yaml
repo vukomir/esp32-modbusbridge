@@ -1,0 +1,191 @@
+# =============================================================================
+# SolPlanet Inverter — derived template sensors
+# Power-flow calculations and friendly status helpers.
+#
+# Entity references assume HA derives entity_ids from
+# `<device_name_slug>_<entity_name_slug>` for the MQTT entities defined in
+# solplanet_inverter.yaml and solplanet_diagnostics.yaml. With
+# device.name = "SolPlanet Inverter", that gives entity_ids of the form
+# `sensor.solplanet_inverter_<entity_name>`. If your HA version produces
+# different ids, find/replace the prefix below.
+#
+# IMPORTANT: house_consumption is a BEST-EFFORT estimate. The inverter does
+# not publish a grid-import-power signal, so we compute consumption from the
+# AC-output and battery flow which is only valid when the inverter is the only
+# source/sink in the household. Do NOT trust it for billing or split-cost logic.
+# =============================================================================
+
+template:
+  - sensor:
+      # -----------------------------------------------------------------------
+      # POWER FLOWS
+      # -----------------------------------------------------------------------
+
+      - name: "Solplanet House Consumption"
+        unique_id: sp_house_consumption_w
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        availability: >
+          {{ states('sensor.solplanet_inverter_eps_active_power') not in ['unknown','unavailable'] }}
+        state: >
+          {% set eps = states('sensor.solplanet_inverter_eps_active_power') | float(0) %}
+          {{ eps | round(0) }}
+
+      - name: "Solplanet Solar Self Consumption"
+        unique_id: sp_solar_self_consumption_w
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        availability: >
+          {{ states('sensor.solplanet_inverter_ac_active_power') not in ['unknown','unavailable'] }}
+        state: >
+          {% set ac = states('sensor.solplanet_inverter_ac_active_power') | float(0) %}
+          {% set l1 = states('sensor.solplanet_inverter_grid_l1_power') | float(0) %}
+          {% set l2 = states('sensor.solplanet_inverter_grid_l2_power') | float(0) %}
+          {% set l3 = states('sensor.solplanet_inverter_grid_l3_power') | float(0) %}
+          {% set exported = (l1 + l2 + l3) %}
+          {% if ac > 0 %}
+            {{ [(ac - exported), 0] | max | round(0) }}
+          {% else %}
+            0
+          {% endif %}
+
+      - name: "Solplanet Solar Self Consumption Pct"
+        unique_id: sp_solar_self_consumption_pct
+        unit_of_measurement: "%"
+        state_class: measurement
+        state: >
+          {% set ac = states('sensor.solplanet_inverter_ac_active_power') | float(0) %}
+          {% set self_use = states('sensor.solplanet_solar_self_consumption') | float(0) %}
+          {% if ac > 50 %}
+            {{ ((self_use / ac) * 100) | round(1) }}
+          {% else %}
+            0
+          {% endif %}
+
+      - name: "Solplanet Solar Status"
+        unique_id: sp_solar_status_text
+        state: >
+          {% set p = states('sensor.solplanet_inverter_ac_active_power') | float(0) %}
+          {% set s = states('sensor.solplanet_inverter_state') %}
+          {% if s == 'Fault' %}
+            Fault
+          {% elif p > 1000 %}
+            Producing
+          {% elif p > 100 %}
+            Low Production
+          {% elif p > 10 %}
+            Idle
+          {% else %}
+            Standby
+          {% endif %}
+
+      # Battery direction and directional power are gated ONLY on battery_status_text
+       # (Idle / Charging / Discharging) because battery_power's sign convention is
+       # not stable enough to use as a tiebreaker — relying on the status string
+       # avoids double-counting if `battery_power` is published as always-positive.
+      - name: "Solplanet Battery Direction"
+        unique_id: sp_battery_direction
+        state: >
+          {{ states('sensor.solplanet_inverter_battery_status') }}
+
+      - name: "Solplanet Battery Charge Power"
+        unique_id: sp_battery_charge_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        state: >
+          {% set p = states('sensor.solplanet_inverter_battery_power') | float(0) %}
+          {% set s = states('sensor.solplanet_inverter_battery_status') %}
+          {% if s == 'Charging' %}
+            {{ (p | abs) | round(0) }}
+          {% else %}
+            0
+          {% endif %}
+
+      - name: "Solplanet Battery Discharge Power"
+        unique_id: sp_battery_discharge_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        state: >
+          {% set p = states('sensor.solplanet_inverter_battery_power') | float(0) %}
+          {% set s = states('sensor.solplanet_inverter_battery_status') %}
+          {% if s == 'Discharging' %}
+            {{ (p | abs) | round(0) }}
+          {% else %}
+            0
+          {% endif %}
+
+      # -----------------------------------------------------------------------
+      # GRID FLOW (derived) — firmware grid_export_total / consumption_today
+      # are stuck at 0 / non-incrementing on this Solplanet model. Derive grid
+      # flow from instantaneous power: net = AC output − EPS load.
+      # Positive → exporting, negative → importing.
+      # -----------------------------------------------------------------------
+      - name: "Solplanet Grid Net Power"
+        unique_id: sp_grid_net_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        availability: >
+          {{ states('sensor.solplanet_inverter_ac_active_power') not in ['unknown','unavailable']
+             and states('sensor.solplanet_inverter_eps_active_power') not in ['unknown','unavailable'] }}
+        state: >
+          {% set ac = states('sensor.solplanet_inverter_ac_active_power') | float(0) %}
+          {% set eps = states('sensor.solplanet_inverter_eps_active_power') | float(0) %}
+          {{ (ac - eps) | round(0) }}
+
+      - name: "Solplanet Grid Export Power"
+        unique_id: sp_grid_export_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        availability: >
+          {{ states('sensor.solplanet_grid_net_power') not in ['unknown','unavailable'] }}
+        state: >
+          {% set n = states('sensor.solplanet_grid_net_power') | float(0) %}
+          {{ [n, 0] | max | round(0) }}
+
+      - name: "Solplanet Grid Import Power"
+        unique_id: sp_grid_import_power
+        unit_of_measurement: "W"
+        device_class: power
+        state_class: measurement
+        availability: >
+          {{ states('sensor.solplanet_grid_net_power') not in ['unknown','unavailable'] }}
+        state: >
+          {% set n = states('sensor.solplanet_grid_net_power') | float(0) %}
+          {{ [(n * -1), 0] | max | round(0) }}
+
+  - binary_sensor:
+      - name: "Solplanet Solar Producing"
+        unique_id: sp_solar_producing
+        device_class: power
+        state: >
+          {{ states('sensor.solplanet_inverter_ac_active_power') | float(0) > 10 }}
+
+      - name: "Solplanet Solar Has Fault"
+        unique_id: sp_solar_has_fault
+        device_class: problem
+        state: >
+          {{ states('sensor.solplanet_inverter_state') == 'Fault' }}
+
+      - name: "Solplanet Battery Low"
+        unique_id: sp_battery_low
+        device_class: battery
+        state: >
+          {{ states('sensor.solplanet_inverter_battery_soc') | float(100) < 20 }}
+
+      - name: "Solplanet Inverter High Temperature"
+        unique_id: sp_inverter_high_temperature
+        device_class: problem
+        state: >
+          {{ states('sensor.solplanet_inverter_internal_temperature') | float(0) > 70 }}
+
+      - name: "Solplanet Inverter Has Warning"
+        unique_id: sp_inverter_has_warning
+        device_class: problem
+        state: >
+          {{ states('sensor.solplanet_inverter_warning_code') | int(0) > 0 }}

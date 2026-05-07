@@ -1,14 +1,46 @@
-.pio
+# PlatformIO build artifacts
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Editor / IDE
 .vscode/**
 .cursor/**
+.idea/
+*.swp
+*.swo
+*~
 
 # Build artifacts
 firmware.bin
 *.bin
+*.elf
+*.hex
 
 # OS metadata
 .DS_Store
+._*
+Thumbs.db
 
-# Claude Code agent config (not committed by author preference)
+# Python (scripts/run_tests.py and friends)
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+
+# Logs and temp
+*.log
+*.tmp
+*.bak
+
+# Secrets / local environment
+.env
+.env.local
+.env.*.local
+secrets.yaml
+
+# Claude Code agent config (local-only, per author preference)
 CLAUDE.md
 .claude/

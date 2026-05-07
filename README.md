@@ -177,13 +177,21 @@ Topics use the structure `{prefix}/{device_type}/{data_type}/{metric}`. The defa
 
 ### **Example Topics**
 ```
-home/inverter/telemetry/active_power_w
-home/inverter/telemetry/e_today_kwh
+home/inverter/telemetry/active_power
+home/inverter/telemetry/energy_today
+home/inverter/telemetry/energy_total
+home/inverter/telemetry/battery_soc
 home/inverter/status/availability
 home/inverter/hardware/max485_status
 ```
 
+Telemetry payloads are JSON `{"value": N, "unit": "X", "timestamp": N, "device_id": "..."}` for numeric metrics and raw scalars for status / state / fault codes.
+
 For the full per-metric list (suggested Home Assistant device classes, units, etc.), subscribe to `{prefix}/{device_type}/telemetry/#` on your broker and inspect the published topic names — they are stable across firmware versions for the same device model.
+
+### **Home Assistant integration**
+
+A complete HA package (MQTT sensors, templates, Riemann integrations, Energy Dashboard wiring) is provided under [`docs/home_assistant/`](docs/home_assistant/README.md). It supports both single-phase and three-phase Solplanet ASW inverters and includes step-by-step setup for the Energy Dashboard (Solar production, Grid import/export, Battery in/out).
 
 ## 🔧 Development
 
@@ -239,20 +247,7 @@ For devices requiring custom logic or complex register handling:
 
 ## 🚀 Releases
 
-### **Latest Release**
-Download the latest firmware from the [Releases](https://github.com/vukomir/esp32-modbusbridge/releases) page.
-
-### **Building from Source**
-```bash
-# Development build
-pio run -e dev
-
-# Production build
-pio run -e prod
-
-# Upload to device
-pio run --target upload
-```
+Download the latest firmware from the [Releases](https://github.com/vukomir/esp32-modbusbridge/releases) page. Build commands are in [Quick Start](#-quick-start).
 
 ## 🔍 Troubleshooting
 
@@ -302,15 +297,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Issues**: [GitHub Issues](https://github.com/vukomir/esp32-modbusbridge/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/vukomir/esp32-modbusbridge/discussions)
 - **Documentation**: Check the `/docs` folder for detailed guides
-
-## 🙏 Acknowledgments
-
-- ESP32 Arduino framework
-- PlatformIO build system
-- ArduinoJson library
-- WebSockets library
-- PubSubClient library
-
----
-
-**Built with ❤️ for the solar monitoring community**

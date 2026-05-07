@@ -1,0 +1,380 @@
+# =============================================================================
+# SolPlanet Inverter — diagnostics package (SINGLE-PHASE variant)
+#
+# Use this file ONLY if your inverter is a single-phase ASW model
+# (firmware register 31001 reports ASCII '1'). For three-phase inverters
+# use solplanet_diagnostics.yaml instead — they are mutually exclusive,
+# do NOT install both.
+#
+# Diff vs. the three-phase version:
+#   - L2 / L3 voltage and current entities removed
+#   - RS / RT / ST line-to-line voltages removed (only meaningful in 3-phase)
+#   - Grid L2 / L3 power and reactive power removed
+#   - EPS L2 / L3 voltage / current / active / reactive removed
+#
+# What stays:
+#   - PV string monitoring (PV1/PV2/PV3) — single-phase inverters can still
+#     have multiple PV strings. If your model has only one string, PV2/PV3
+#     entities will show 0 W and you can hide them in HA.
+#   - L1 voltage and current (the only AC phase on a 1ph inverter)
+#   - Grid L1 power / reactive
+#   - EPS L1 voltage / current / active / reactive
+#   - Bus voltage, temperatures, battery diagnostics, runtime / grid metadata
+# =============================================================================
+
+mqtt:
+  sensor:
+    # -------------------------------------------------------------------------
+    # PV STRINGS — per-string voltage, current, power
+    # -------------------------------------------------------------------------
+    - name: "PV1 Voltage"
+      unique_id: sp_pv1_voltage
+      state_topic: "home/inverter/telemetry/pv1_voltage"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "V"
+      device_class: voltage
+      state_class: measurement
+      availability: &avail
+        - topic: "home/inverter/status/availability"
+          payload_available: "online"
+          payload_not_available: "offline"
+      device: &dev
+        identifiers: [esp32_solplanet_bridge]
+        name: "SolPlanet Inverter"
+        model: "ASW (single-phase)"
+        manufacturer: "SolPlanet"
+        configuration_url: "http://modbusbridge.local"
+
+    - name: "PV1 Current"
+      unique_id: sp_pv1_current
+      state_topic: "home/inverter/telemetry/pv1_current"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "A"
+      device_class: current
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "PV1 Power"
+      unique_id: sp_pv1_power
+      state_topic: "home/inverter/telemetry/pv1_power"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "W"
+      device_class: power
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "PV2 Voltage"
+      unique_id: sp_pv2_voltage
+      state_topic: "home/inverter/telemetry/pv2_voltage"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "V"
+      device_class: voltage
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "PV2 Current"
+      unique_id: sp_pv2_current
+      state_topic: "home/inverter/telemetry/pv2_current"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "A"
+      device_class: current
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "PV2 Power"
+      unique_id: sp_pv2_power
+      state_topic: "home/inverter/telemetry/pv2_power"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "W"
+      device_class: power
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "PV3 Voltage"
+      unique_id: sp_pv3_voltage
+      state_topic: "home/inverter/telemetry/pv3_voltage"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "V"
+      device_class: voltage
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "PV3 Current"
+      unique_id: sp_pv3_current
+      state_topic: "home/inverter/telemetry/pv3_current"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "A"
+      device_class: current
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "PV3 Power"
+      unique_id: sp_pv3_power
+      state_topic: "home/inverter/telemetry/pv3_power"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "W"
+      device_class: power
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "Bus Voltage"
+      unique_id: sp_bus_voltage
+      state_topic: "home/inverter/telemetry/bus_voltage"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "V"
+      device_class: voltage
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    # -------------------------------------------------------------------------
+    # GRID AC — single phase only
+    # -------------------------------------------------------------------------
+    - name: "L1 Voltage"
+      unique_id: sp_l1_voltage
+      state_topic: "home/inverter/telemetry/l1_voltage"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "V"
+      device_class: voltage
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "L1 Current"
+      unique_id: sp_l1_current
+      state_topic: "home/inverter/telemetry/l1_current"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "A"
+      device_class: current
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "Grid L1 Power"
+      unique_id: sp_grid_l1_power
+      state_topic: "home/inverter/telemetry/grid_l1_power"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "W"
+      device_class: power
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "Grid L1 Reactive Power"
+      unique_id: sp_grid_l1_reactive
+      state_topic: "home/inverter/telemetry/grid_l1_reactive"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "var"
+      device_class: reactive_power
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    # -------------------------------------------------------------------------
+    # EPS — single phase only
+    # -------------------------------------------------------------------------
+    - name: "EPS L1 Voltage"
+      unique_id: sp_eps_l1_voltage
+      state_topic: "home/inverter/telemetry/eps_l1_voltage"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "V"
+      device_class: voltage
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "EPS L1 Current"
+      unique_id: sp_eps_l1_current
+      state_topic: "home/inverter/telemetry/eps_l1_current"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "A"
+      device_class: current
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "EPS L1 Active Power"
+      unique_id: sp_eps_l1_active_power
+      state_topic: "home/inverter/telemetry/eps_l1_active_power"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "W"
+      device_class: power
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "EPS L1 Reactive Power"
+      unique_id: sp_eps_l1_reactive_power
+      state_topic: "home/inverter/telemetry/eps_l1_reactive_power"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "var"
+      device_class: reactive_power
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    # -------------------------------------------------------------------------
+    # TEMPERATURES
+    # -------------------------------------------------------------------------
+    - name: "Internal Temperature"
+      unique_id: sp_temperature_internal
+      state_topic: "home/inverter/telemetry/temperature_internal"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "Temperature Inverter U"
+      unique_id: sp_temperature_inverter_u
+      state_topic: "home/inverter/telemetry/temperature_inverter_u"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "Boost Temperature"
+      unique_id: sp_temperature_boost
+      state_topic: "home/inverter/telemetry/temperature_boost"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "Battery Environment Temperature"
+      unique_id: sp_battery_env_temperature
+      state_topic: "home/inverter/telemetry/battery_env_temperature"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    # -------------------------------------------------------------------------
+    # BATTERY DIAGNOSTICS
+    # -------------------------------------------------------------------------
+    - name: "Battery Charge Limit"
+      unique_id: sp_battery_charge_limit
+      state_topic: "home/inverter/telemetry/battery_charge_limit"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "A"
+      device_class: current
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "Battery Discharge Limit"
+      unique_id: sp_battery_discharge_limit
+      state_topic: "home/inverter/telemetry/battery_discharge_limit"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "A"
+      device_class: current
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "Battery Cycles"
+      unique_id: sp_battery_cycles
+      state_topic: "home/inverter/telemetry/battery_cycles"
+      state_class: total_increasing
+      availability: *avail
+      device: *dev
+
+    # -------------------------------------------------------------------------
+    # RUNTIME / CONFIG / GRID META
+    # -------------------------------------------------------------------------
+    - name: "Total Operating Hours"
+      unique_id: sp_hours_total
+      state_topic: "home/inverter/telemetry/hours_total"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "h"
+      device_class: duration
+      state_class: total_increasing
+      availability: *avail
+      device: *dev
+
+    - name: "Connect Time"
+      unique_id: sp_connect_time
+      state_topic: "home/inverter/telemetry/connect_time"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "s"
+      device_class: duration
+      state_class: measurement
+      availability: *avail
+      device: *dev
+
+    - name: "Modbus Address"
+      unique_id: sp_modbus_address
+      state_topic: "home/inverter/telemetry/modbus_address"
+      entity_category: diagnostic
+      availability: *avail
+      device: *dev
+
+    - name: "Grid Code"
+      unique_id: sp_grid_code
+      state_topic: "home/inverter/telemetry/grid_code"
+      entity_category: diagnostic
+      availability: *avail
+      device: *dev
+
+    - name: "Grid Code Standard"
+      unique_id: sp_grid_code_standard
+      state_topic: "home/inverter/telemetry/grid_code_standard"
+      entity_category: diagnostic
+      availability: *avail
+      device: *dev
+
+    - name: "Grid Rated Voltage"
+      unique_id: sp_grid_rated_voltage
+      state_topic: "home/inverter/telemetry/grid_rated_voltage"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "V"
+      device_class: voltage
+      entity_category: diagnostic
+      availability: *avail
+      device: *dev
+
+    - name: "Grid Rated Frequency"
+      unique_id: sp_grid_rated_frequency
+      state_topic: "home/inverter/telemetry/grid_rated_frequency"
+      value_template: "{{ value_json.value }}"
+      unit_of_measurement: "Hz"
+      device_class: frequency
+      entity_category: diagnostic
+      availability: *avail
+      device: *dev
+
+    - name: "Fault State"
+      unique_id: sp_fault_state
+      state_topic: "home/inverter/telemetry/fault_state"
+      entity_category: diagnostic
+      availability: *avail
+      device: *dev
+
+    - name: "Battery Status Code"
+      unique_id: sp_battery_status_code
+      state_topic: "home/inverter/telemetry/battery_status"
+      entity_category: diagnostic
+      availability: *avail
+      device: *dev
+
+    - name: "Device State Code"
+      unique_id: sp_device_state_code
+      state_topic: "home/inverter/telemetry/device_state"
+      entity_category: diagnostic
+      availability: *avail
+      device: *dev
