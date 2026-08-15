@@ -94,6 +94,14 @@ static const DeviceInfo SUPPORTED_DEVICES[] = {
 // ASSERT, not a runtime surprise.
 #define LOG_STORE_DATA_BYTES 7168
 
+// The data area is split into two independent rings. Boot-window records go to
+// the first, everything afterwards to the second, and each evicts only its own
+// oldest. Without this split a steady WARN/ERROR source - the known RS485 CRC
+// noise emits an ERROR plus a WARN every ~25s - fills the whole ring and evicts
+// the startup narrative within ~16 minutes, which defeats the entire point.
+// Must be a multiple of 4 and smaller than LOG_STORE_DATA_BYTES.
+#define LOG_STORE_BOOT_BYTES 3584
+
 // Longest message body retained per record. Lines above this are stored
 // truncated and flagged; ESPLogger's own format buffer is 256 bytes.
 #define LOG_STORE_MAX_MSG 160

@@ -521,9 +521,11 @@ void WebUI::handleLogDownload()
                      "# last reset : %s\n"
                      "# uptime     : %lu s\n"
                      "# free heap  : %u bytes\n"
-                     "# ring used  : %u / %u bytes\n"
+                     "# boot seg   : %u / %u bytes (this boot, protected)\n"
+                     "# rolling seg: %u / %u bytes\n"
                      "# dropped    : %lu records\n"
                      "# timestamps are milliseconds since boot, not wall clock\n"
+                     "# sections are NOT one timeline - rolling can predate boot\n"
                      "#\n",
                      FIRMWARE_VERSION, GIT_BRANCH, GIT_HASH,
                      wifiManager.getDeviceId().c_str(),
@@ -531,7 +533,8 @@ void WebUI::handleLogDownload()
                      LogStore::resetReasonStr(),
                      (unsigned long)(millis() / 1000),
                      ESP.getFreeHeap(),
-                     LogStore::usedBytes(), LogStore::capacityBytes(),
+                     LogStore::bootUsedBytes(), LogStore::bootCapacityBytes(),
+                     LogStore::rollingUsedBytes(), LogStore::rollingCapacityBytes(),
                      (unsigned long)LogStore::droppedRecords());
     if (n > 0)
     {
@@ -542,9 +545,20 @@ void WebUI::handleLogDownload()
     // record and releases it before we touch the network.
     char line[LOG_STORE_MAX_MSG + 64];
     size_t written = 0;
+    uint8_t shownSegment = 0xFF;
     LogStore::Cursor cursor = LogStore::openRead();
     while (LogStore::next(cursor, line, sizeof(line), written))
     {
+        // Label the segment boundary. The two are separate views, not one
+        // timeline, so splicing them silently would misrepresent the ordering.
+        if (cursor.recordSegment != shownSegment)
+        {
+            shownSegment = cursor.recordSegment;
+            const char *hdr = (shownSegment == LogStore::SEG_BOOT)
+                                  ? "# --- boot segment (this boot, protected from eviction) ---\n"
+                                  : "# --- rolling segment (recent activity, may predate this boot) ---\n";
+            server.sendContent(hdr, strlen(hdr));
+        }
         server.sendContent(line, written);
     }
 
