@@ -25,6 +25,30 @@ static int drain(String *first = nullptr, String *last = nullptr)
     return count;
 }
 
+// Finds the first rendered line containing `needle`. Position-independent,
+// because begin() writes a marker into BOTH segments and read order is
+// boot-then-rolling, so "the last line" is not a stable thing to assert on.
+static bool findLine(const char *needle, String &out)
+{
+    char buf[512];
+    size_t n = 0;
+    LogStore::Cursor c = LogStore::openRead();
+    while (LogStore::next(c, buf, sizeof(buf), n))
+    {
+        if (String(buf).indexOf(needle) >= 0)
+        {
+            out = String(buf);
+            return true;
+        }
+    }
+    return false;
+}
+
+// begin() emits one boot marker into each segment: the boot segment's marks
+// this session's startup, the rolling one marks the seam where an overflowing
+// boot lands after the previous session's records.
+static const int MARKERS_PER_BOOT = 2;
+
 void setUp(void)
 {
     LogStore::_resetForTest();
@@ -41,9 +65,9 @@ void test_cold_boot_initialises_clean()
     TEST_ASSERT_EQUAL_UINT32(0, LogStore::droppedRecords());
     TEST_ASSERT_EQUAL_UINT16(LOG_STORE_DATA_BYTES, LogStore::capacityBytes());
 
-    // begin() always leaves exactly the boot marker behind.
+    // begin() leaves exactly the two boot markers behind, one per segment.
     String first;
-    TEST_ASSERT_EQUAL_INT(1, drain(&first));
+    TEST_ASSERT_EQUAL_INT(MARKERS_PER_BOOT, drain(&first));
     TEST_ASSERT_TRUE(first.indexOf("=== BOOT #1") >= 0);
     TEST_ASSERT_TRUE(first.indexOf("reason=") >= 0);
 }
@@ -56,24 +80,31 @@ void test_warm_boot_preserves_previous_session()
     // test_reboot_resets_boot_segment_but_keeps_rolling for the other half.
     LogStore::sink(ESPLogger::ERROR, "previous session died here",
                    LOG_BOOT_WINDOW_MS + 500);
-    TEST_ASSERT_EQUAL_INT(2, drain());
+    TEST_ASSERT_EQUAL_INT(MARKERS_PER_BOOT + 1, drain());
 
     // Simulate a reboot: region stays intact, begin() runs again.
     LogStore::begin();
 
-    // Two records survive: the new boot marker in the reset boot segment, and
-    // the previous session's line still in the rolling segment. Boot #1's own
-    // marker is gone with the boot segment, by design.
+    // Three records survive: boot #2's two markers, plus the previous session's
+    // line still in the rolling segment. Boot #1's boot-segment marker is gone
+    // with the segment reset; its rolling marker was evicted by neither, so the
+    // rolling ring holds boot #1's marker, the ERROR, and boot #2's marker.
     String first, last;
     int count = drain(&first, &last);
-    TEST_ASSERT_EQUAL_INT(2, count);
+    TEST_ASSERT_EQUAL_INT(MARKERS_PER_BOOT + 2, count);
     TEST_ASSERT_EQUAL_UINT32(2, LogStore::bootCount());
 
     // Read order is boot segment then rolling segment, NOT chronological - the
     // rolling segment holds records older than the boot segment, so the two are
-    // presented as separate sections rather than one spliced timeline.
+    // presented as separate sections rather than one spliced timeline. The boot
+    // segment is read first, so the very first record is this boot's marker.
     TEST_ASSERT_TRUE(first.indexOf("=== BOOT #2") >= 0);
-    TEST_ASSERT_TRUE(last.indexOf("previous session died here") >= 0);
+    (void)last;
+
+    // The previous session's line survives somewhere in the rolling segment;
+    // its position is not part of the contract.
+    String line;
+    TEST_ASSERT_TRUE(findLine("previous session died here", line));
 }
 
 // Range invariants matter as much as the magic - a plausible magic with a
@@ -86,7 +117,7 @@ void test_corrupt_region_is_wiped()
 
     TEST_ASSERT_EQUAL_UINT32(1, LogStore::bootCount());
     String first;
-    TEST_ASSERT_EQUAL_INT(1, drain(&first));
+    TEST_ASSERT_EQUAL_INT(MARKERS_PER_BOOT, drain(&first));
     TEST_ASSERT_TRUE(first.indexOf("=== BOOT #1") >= 0);
 }
 
@@ -100,20 +131,24 @@ void test_render_format()
 
     LogStore::sink(ESPLogger::WARN, "hello world", 1234);
 
+    String line;
+    TEST_ASSERT_TRUE(findLine("hello world", line));
+    TEST_ASSERT_EQUAL_STRING("[1234][WARN] hello world\n", line.c_str());
+
+    // `written` must be the byte count actually produced, so the HTTP layer can
+    // pass it straight to sendContent() without calling strlen again.
     char buf[256];
     size_t n = 0;
-    size_t lastWritten = 0;
-    String lastLine;
+    size_t writtenForHit = 0;
     LogStore::Cursor c = LogStore::openRead();
     while (LogStore::next(c, buf, sizeof(buf), n))
     {
-        lastLine = String(buf);
-        lastWritten = n; // next() zeroes `n` on the final, failing call
+        if (String(buf).indexOf("hello world") >= 0)
+        {
+            writtenForHit = n;
+        }
     }
-    TEST_ASSERT_EQUAL_STRING("[1234][WARN] hello world\n", lastLine.c_str());
-    // written must be the byte count actually produced, so the HTTP layer can
-    // pass it straight to sendContent() without calling strlen again.
-    TEST_ASSERT_EQUAL_UINT32(25, (uint32_t)lastWritten);
+    TEST_ASSERT_EQUAL_UINT32(25, (uint32_t)writtenForHit);
 }
 
 // Oldest records are evicted from the rolling segment, dropped is counted, and
@@ -246,17 +281,11 @@ void test_long_message_truncated_safely()
 
     LogStore::sink(ESPLogger::ERROR, big, 42);
 
-    char buf[512];
-    size_t n = 0;
-    String lastLine;
-    LogStore::Cursor c = LogStore::openRead();
-    while (LogStore::next(c, buf, sizeof(buf), n))
-    {
-        lastLine = String(buf);
-    }
+    String line;
+    TEST_ASSERT_TRUE(findLine("[42][ERROR]", line));
     // "[42][ERROR] " + LOG_STORE_MAX_MSG chars + "\n"
     TEST_ASSERT_EQUAL_UINT32((uint32_t)(strlen("[42][ERROR] ") + LOG_STORE_MAX_MSG + 1),
-                             (uint32_t)lastLine.length());
+                             (uint32_t)line.length());
     TEST_ASSERT_TRUE(LogStore::usedBytes() <= LogStore::capacityBytes());
 }
 
