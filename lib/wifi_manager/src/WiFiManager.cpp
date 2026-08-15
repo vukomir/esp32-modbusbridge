@@ -57,7 +57,18 @@ bool WiFiManager::begin()
         }
     }
 
-    ESPLogger::error("Failed to initialize WiFi");
+    // Deliberately leave initialized == true here. isConnected() is
+    // `initialized && !apMode && WiFi.status() == WL_CONNECTED` and
+    // handleConnection() returns early on !initialized, so a failed begin() used
+    // to disable WiFi management permanently for the rest of the uptime. Nothing
+    // ever calls begin() again. Meanwhile the ESP32 driver keeps retrying the
+    // association on its own, so the radio would come up seconds later while
+    // every isConnected() caller (MQTT, mDNS, NTP, the status page) stayed
+    // convinced WiFi was down until the next reboot — which rolled the same dice
+    // again. Staying initialized lets handleConnection() observe the late
+    // association and bring mDNS/NTP/MQTT up.
+    initialized = true;
+    ESPLogger::error("Failed to initialize WiFi - handleConnection() will keep retrying");
     return false;
 }
 
@@ -83,11 +94,26 @@ bool WiFiManager::connectSTA()
     WiFi.begin(ssid.c_str(), password.c_str());
 
     unsigned long startTime = millis();
-    const unsigned long timeout = 15000; // 15 seconds
+    // 30s, was 15s. WiFi.status() only reaches WL_CONNECTED after DHCP, so this
+    // window has to cover scan + auth + lease. 15s is marginal on a busy AP and
+    // a miss here is expensive (see the begin() failure path).
+    const unsigned long timeout = 30000;
 
+    // Log the driver status while waiting. When this does time out, the status
+    // code is the only thing that distinguishes scan latency (WL_NO_SSID_AVAIL)
+    // from a bad password (WL_CONNECT_FAILED) from a stalled DHCP lease
+    // (WL_DISCONNECTED / WL_IDLE_STATUS). Without it the failure is opaque.
+    unsigned long lastStatusLog = startTime;
     while (WiFi.status() != WL_CONNECTED && millis() - startTime < timeout)
     {
         vTaskDelay(pdMS_TO_TICKS(200));
+
+        if (millis() - lastStatusLog >= 5000)
+        {
+            lastStatusLog = millis();
+            ESPLogger::info("... still associating (%lus elapsed, WiFi.status()=%d)",
+                            (millis() - startTime) / 1000, WiFi.status());
+        }
     }
 
     if (WiFi.status() == WL_CONNECTED)
@@ -112,7 +138,8 @@ bool WiFiManager::connectSTA()
         return true;
     }
 
-    ESPLogger::error("Failed to connect to WiFi: %s", ssid.c_str());
+    ESPLogger::error("Failed to connect to WiFi: %s (WiFi.status()=%d after %lus)",
+                     ssid.c_str(), WiFi.status(), (millis() - startTime) / 1000);
     return false;
 }
 
