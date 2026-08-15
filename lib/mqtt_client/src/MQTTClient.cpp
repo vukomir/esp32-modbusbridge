@@ -164,7 +164,11 @@ bool MQTTClient::connect()
 
     // Debug logging
     ESPLogger::info("MQTT connecting as: %s", clientId.c_str());
-    ESPLogger::info("Username: '%s' (length: %d)", username.c_str(), username.length());
+    // Presence and length only, matching the password line below. Logs are now
+    // retained across reboots and downloadable over an unauthenticated web UI,
+    // so the username must not appear verbatim; length is enough to diagnose a
+    // stray space or an empty config field.
+    ESPLogger::info("Username: %s (length: %d)", username.length() > 0 ? "[SET]" : "[EMPTY]", username.length());
     ESPLogger::info("Password: %s (length: %d)", password.length() > 0 ? "[SET]" : "[EMPTY]", password.length());
 
     // Small delay to ensure TCP connection is fully closed
