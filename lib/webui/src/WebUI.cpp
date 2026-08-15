@@ -1156,6 +1156,14 @@ String WebUI::generateOTAForm()
     html += "<div style='font-size:0.875rem;color:var(--text-light);margin-top:0.5rem'>";
     html += "Supported formats: .bin files only. Maximum size: 4MB";
     html += "</div>";
+    // Pointer to the release page rather than an on-device version check:
+    // see the flash-cost note on FIRMWARE_RELEASES_URL in include/constants.h.
+    // rel=noopener is not optional here - this page is served over plain HTTP
+    // on the LAN, so the opened tab must not get a handle on window.opener.
+    html += "<div style='font-size:0.875rem;margin-top:0.5rem'>";
+    html += "📥 <a href='" FIRMWARE_RELEASES_URL "' target='_blank' rel='noopener noreferrer'>";
+    html += "Download the latest firmware.bin from GitHub</a>";
+    html += "</div>";
     html += "</div>";
 
     html += "<div class='button-group'>";
