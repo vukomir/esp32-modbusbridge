@@ -616,13 +616,11 @@ void WebUI::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_
             }
         }
 
-        // Clear old logs from buffer to force fresh timestamps
-        if (logBufferCount > 5)
-        {
-            ESPLogger::info("Clearing old log buffer for fresh NTP timestamps");
-            logBufferCount = 0;
-            logBufferIndex = 0;
-        }
+        // NOTE: this used to wipe the log buffer here "for fresh NTP
+        // timestamps", which meant opening the console destroyed the very
+        // history you opened it to read. Removed. Entries logged before NTP
+        // sync carry a millis() timestamp and the client already distinguishes
+        // them via the "ntp" flag below.
 
         // Send welcome message with system info
         String welcomeMsg = "{\"type\":\"welcome\",\"message\":\"Connected to " + String(DEVICE_NAME) +
@@ -639,27 +637,33 @@ void WebUI::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_
         String initMsg = "{\"type\":\"init\",\"message\":\"" + debugInfo + "\"}";
         wsServer.sendTXT(num, initMsg);
 
-        // Send only the most recent log entry if available
-        if (logBufferCount > 0)
+        // Replay recent history so a freshly opened console is not blank.
+        // Capped well below LOG_BUFFER_SIZE: each entry is a handful of
+        // transient Strings, and this runs inside the WebSocket event handler
+        // on webTask. For anything older, use /api/logs/download.
         {
-            int lastIndex = (logBufferIndex - 1 + LOG_BUFFER_SIZE) % LOG_BUFFER_SIZE;
-            const LogEntry &entry = logBuffer[lastIndex];
-
-            // Use timestamp directly from log buffer (already converted in logCallback)
-            uint64_t realTime = entry.timestamp;
+            const int replayCount = min(logBufferCount, 10);
+            const int firstIndex =
+                (logBufferIndex - replayCount + LOG_BUFFER_SIZE) % LOG_BUFFER_SIZE;
             time_t now = time(nullptr);
-            bool useNTP = (now > 1000000000) && (realTime > 1000000000000ULL); // Check if timestamp is Unix time
 
-            // Build JSON safely with proper escaping
-            String escapedMessage = escapeJsonString(String(entry.message));
+            for (int i = 0; i < replayCount; i++)
+            {
+                const LogEntry &entry = logBuffer[(firstIndex + i) % LOG_BUFFER_SIZE];
 
-            String json = "{\"type\":\"log\",";
-            json += "\"timestamp\":" + String((uint64_t)realTime) + ",";
-            json += "\"level\":\"" + String(ESPLogger::logLevelToString(entry.level)) + "\",";
-            json += "\"message\":\"" + escapedMessage + "\",";
-            json += "\"ntp\":" + String(useNTP ? "true" : "false") + "}";
+                // Timestamps are already converted in logCallback; magnitude
+                // tells us whether this one is Unix ms or raw millis().
+                uint64_t realTime = entry.timestamp;
+                bool useNTP = (now > 1000000000) && (realTime > 1000000000000ULL);
 
-            wsServer.sendTXT(num, json);
+                String json = "{\"type\":\"log\",";
+                json += "\"timestamp\":" + String((uint64_t)realTime) + ",";
+                json += "\"level\":\"" + String(ESPLogger::logLevelToString(entry.level)) + "\",";
+                json += "\"message\":\"" + escapeJsonString(String(entry.message)) + "\",";
+                json += "\"ntp\":" + String(useNTP ? "true" : "false") + "}";
+
+                wsServer.sendTXT(num, json);
+            }
         }
         break;
     }
