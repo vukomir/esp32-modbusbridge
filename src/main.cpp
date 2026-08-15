@@ -91,7 +91,10 @@ void setup()
     ESPLogger::info("Free heap after config: %u bytes", ESP.getFreeHeap());
 
     // Initialize components
-    wifiManager.begin();
+    if (!wifiManager.begin())
+    {
+        ESPLogger::warn("WiFi did not come up during setup() - handleConnection() will keep retrying");
+    }
     webUI.begin(80);
 
     // ESP32 has plenty of memory - enable all components
