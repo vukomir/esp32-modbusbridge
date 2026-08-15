@@ -50,6 +50,7 @@ private:
     void handleCaptivePortal();
     void handleRestartmDNS();
     void handleLogsAPI();
+    void handleLogDownload();
     void handleConsole();
     void handleLogConfig();
     void handleAPIStatus();

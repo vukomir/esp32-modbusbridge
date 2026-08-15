@@ -1,5 +1,6 @@
 #include "WebUI.h"
 #include "ModbusClient.h"
+#include "LogStore.h"
 #include <ESPLogger.h>
 #include "constants.h"
 #include <Update.h>
@@ -76,6 +77,8 @@ bool WebUI::begin(uint16_t port)
               { handleConsole(); });
     server.on("/api/logs", HTTP_GET, [this]()
               { handleLogsAPI(); });
+    server.on("/api/logs/download", HTTP_GET, [this]()
+              { handleLogDownload(); });
     server.on("/api/log/config", HTTP_POST, [this]()
               { handleLogConfig(); });
     server.on("/api/status", HTTP_GET, [this]()
@@ -478,6 +481,80 @@ void WebUI::handleLogsAPI()
     json += "\"bufferSize\":" + String(LOG_BUFFER_SIZE) + "}";
 
     server.send(200, "application/json", json);
+}
+
+// GET /api/logs/download - the RTC-backed log ring as a plain text file.
+//
+// This is the only chunked response in the web UI. The payload is only ~8KB and
+// a single String would fit in today's heap, but reserve() fails silently and
+// handleLogsAPI() above already carries the scar tissue from that ("Send only
+// recent logs to prevent memory issues", capping itself at 20 entries).
+// Streaming also costs nothing extra in latency: webTask's 20ms vTaskDelay sits
+// between handleClient() calls, not between sendContent() calls.
+//
+// No CSRF: it is a GET with no side effects, matching /api/logs and
+// /api/status. Note the whole web UI is unauthenticated, so this endpoint is no
+// more exposed than /api/status - which already returns the SSID and IP.
+void WebUI::handleLogDownload()
+{
+    server.sendHeader("X-Content-Type-Options", "nosniff");
+    server.sendHeader("X-Frame-Options", "DENY");
+    server.sendHeader("Cache-Control", "no-store");
+
+    char filename[96];
+    snprintf(filename, sizeof(filename),
+             "attachment; filename=\"modbusbridge-b%lu-%lus.log\"",
+             (unsigned long)LogStore::bootCount(),
+             (unsigned long)(millis() / 1000));
+    server.sendHeader("Content-Disposition", filename);
+
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/plain", "");
+
+    // Preamble: the context you would otherwise have to ask the user for.
+    char pre[512];
+    int n = snprintf(pre, sizeof(pre),
+                     "# Modbus Bridge log dump\n"
+                     "# firmware   : %s (%s, %s)\n"
+                     "# device id  : %s\n"
+                     "# boot count : %lu\n"
+                     "# last reset : %s\n"
+                     "# uptime     : %lu s\n"
+                     "# free heap  : %u bytes\n"
+                     "# ring used  : %u / %u bytes\n"
+                     "# dropped    : %lu records\n"
+                     "# timestamps are milliseconds since boot, not wall clock\n"
+                     "#\n",
+                     FIRMWARE_VERSION, GIT_BRANCH, GIT_HASH,
+                     wifiManager.getDeviceId().c_str(),
+                     (unsigned long)LogStore::bootCount(),
+                     LogStore::resetReasonStr(),
+                     (unsigned long)(millis() / 1000),
+                     ESP.getFreeHeap(),
+                     LogStore::usedBytes(), LogStore::capacityBytes(),
+                     (unsigned long)LogStore::droppedRecords());
+    if (n > 0)
+    {
+        server.sendContent(pre, (size_t)n < sizeof(pre) ? (size_t)n : sizeof(pre) - 1);
+    }
+
+    // One record at a time into a stack buffer. LogStore takes the lock per
+    // record and releases it before we touch the network.
+    char line[LOG_STORE_MAX_MSG + 64];
+    size_t written = 0;
+    LogStore::Cursor cursor = LogStore::openRead();
+    while (LogStore::next(cursor, line, sizeof(line), written))
+    {
+        server.sendContent(line, written);
+    }
+
+    if (cursor.overrun)
+    {
+        const char *warn = "# --- log overrun during read, older entries lost ---\n";
+        server.sendContent(warn, strlen(warn));
+    }
+
+    server.sendContent(""); // terminate chunked encoding
 }
 
 void WebUI::onWebSocketEventStatic(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
@@ -1754,7 +1831,14 @@ String WebUI::generateConsolePage()
     html += "<button id='clearBtn' class='btn-secondary'>🗑️ Clear</button>";
     html += "<button id='scrollBtn' class='btn-secondary'>📜 Follow: ON</button>";
     html += "<button id='bottomBtn' class='btn-secondary'>⬇️ Bottom</button>";
+    // Plain link, not fetch(): the browser handles Content-Disposition itself,
+    // and this works even when the WebSocket console cannot connect.
+    html += "<a href='/api/logs/download' class='btn-secondary' style='text-decoration:none;'>💾 Download log</a>";
     html += "<span id='connectionStatus' style='margin-left:1rem;font-weight:bold;color:#6b7280;'>Connecting...</span>";
+    html += "</div>";
+    html += "<div style='font-size:0.8125rem;color:var(--text-light);margin-top:-0.5rem;'>";
+    html += "The download covers boot #" + String(LogStore::bootCount());
+    html += " and earlier sessions held in RTC memory (survives reboots and crashes, not a power cut).";
     html += "</div>";
 
     // Console output area with scroll indicator
