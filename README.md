@@ -36,6 +36,23 @@ A comprehensive ESP32-based monitoring system for solar inverters and smart mete
 - **System Status**: Memory usage, uptime, connection status.
 - **Per-poll retry with exponential backoff**: transient bus errors (CRC mismatch, timeout, partial frame) are retried 3× with 100/200/400 ms backoff before failing the poll.
 - **Device-availability MQTT topic**: after several consecutive failed polls the device publishes `offline` to its availability topic so Home Assistant can mark sensors unavailable instead of showing stale retained values.
+- **Downloadable boot log**: `GET /api/logs/download` returns a plain-text log kept in RTC memory, so a boot that fails can be diagnosed after the fact without a serial cable. See below.
+
+### 📥 **Boot log retention**
+
+Logs are captured into a ~7 KB ring buffer in the ESP32's RTC memory, starting from the first line of `setup()`. Download them from the console page or with `curl http://<device>/api/logs/download -o boot.log`.
+
+What it holds: roughly 2–3 boots' worth of history. Everything is kept for the first 60 seconds after boot; after that only `WARN` and `ERROR` are retained, so routine polling doesn't evict the startup narrative. An error briefly re-opens full capture.
+
+**What it survives:** `ESP.restart()`, a panic, and both watchdogs.
+**What it does not survive:** a power cut, a brownout, or an RTC-watchdog reset — which is what fires if the *bootloader* hangs. Failures before application code runs stay invisible.
+
+Two caveats worth knowing:
+
+- Timestamps are milliseconds since boot, not wall-clock. The NTP-sync line in the log is your anchor to real time.
+- The store only sees what passes the configured log level. `DEBUG` lines are captured during the boot window **only if `log_level` is already set to `debug`** — the default is `info`. Set it before reproducing a problem.
+
+Retention costs no flash space and causes no flash wear. The download endpoint is unauthenticated, like the rest of the web UI — see [Web UI hardening](#web-ui-hardening).
 
 ## 🛠️ Hardware Requirements
 
@@ -156,6 +173,7 @@ If you need to legitimately use one of those byte values for a non-Modbus reason
 - **Destructive endpoints are POST-only.** `/reboot`, `/factory`, and `/restart_mdns` cannot be triggered by `<img src="...">` or other GET-based CSRF tricks.
 - **All config-derived strings** (SSID, hostname, MQTT broker, etc.) are HTML-escaped before being inlined into the page. Closes stored XSS via the setup form.
 - **Known limitation:** OTA upload validates CSRF *after* the binary has been received. The new image is staged but the auto-restart is blocked. Hardening this further (CSRF check at upload start) is tracked as a follow-up.
+- **There is no authentication.** Every endpoint — including `/factory`, `/update`, and `/api/logs/download` — is open to anyone who can reach the device. `/api/status` already returns the SSID and IP in clear, and the downloadable log contains the same. Do not expose port 80 to the internet. Credentials are not logged: the MQTT username and password are recorded as `[SET]`/`[EMPTY]` with a length only, and the WiFi password is never formatted into a log line.
 
 ## 📡 MQTT Topics
 
