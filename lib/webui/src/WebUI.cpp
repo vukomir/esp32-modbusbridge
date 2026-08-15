@@ -523,7 +523,7 @@ void WebUI::handleLogDownload()
                      "# free heap  : %u bytes\n"
                      "# boot seg   : %u / %u bytes (this boot, protected)\n"
                      "# rolling seg: %u / %u bytes\n"
-                     "# dropped    : %lu records\n"
+                     "# dropped    : %lu records (cumulative, all boots)\n"
                      "# timestamps are milliseconds since boot, not wall clock\n"
                      "# sections are NOT one timeline - rolling can predate boot\n"
                      "#\n",

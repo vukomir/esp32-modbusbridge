@@ -100,7 +100,13 @@ static const DeviceInfo SUPPORTED_DEVICES[] = {
 // noise emits an ERROR plus a WARN every ~25s - fills the whole ring and evicts
 // the startup narrative within ~16 minutes, which defeats the entire point.
 // Must be a multiple of 4 and smaller than LOG_STORE_DATA_BYTES.
-#define LOG_STORE_BOOT_BYTES 3584
+//
+// Sized from a real info-level boot: the startup narrative runs to roughly 90
+// records at ~68 bytes each (many lines carry 4-byte emoji), so 3584 truncated
+// it part way through WiFi init. 4608 covers the run through MQTT connect and
+// the first poll, leaving 2560 - about 38 records - for the rolling segment,
+// which only needs to hold the previous session's final moments.
+#define LOG_STORE_BOOT_BYTES 4608
 
 // Longest message body retained per record. Lines above this are stored
 // truncated and flagged; ESPLogger's own format buffer is 256 bytes.

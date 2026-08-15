@@ -247,17 +247,49 @@ bool Poller::readAndPublishTelemetry()
 
 void Poller::publishTelemetryPoints(const std::vector<TelemetryPoint> &points)
 {
+    // One line for the whole batch, not one per metric.
+    //
+    // MQTTClient::publishTelemetry() returns false immediately when the client
+    // is not connected, and on a cold boot the first poll fires seconds before
+    // MQTT finishes connecting - measured at ~1.5s ahead on real hardware. That
+    // turned a single condition into ~110 identical ERROR records per boot,
+    // which was over half the log ring and evicted the startup narrative before
+    // anyone could read it back.
+    if (!mqtt.isConnected())
+    {
+        ESPLogger::warn("MQTT not connected - skipping %u telemetry point(s)",
+                        (unsigned)points.size());
+        return;
+    }
+
+    unsigned failed = 0;
+    const char *firstFailure = nullptr;
+
     for (const auto &point : points)
     {
-        if (!point.value.isEmpty())
+        if (point.value.isEmpty())
         {
-            // Use new generic topic structure for telemetry
-            bool success = mqtt.publishTelemetry(point.name, point.value, point.unit, true);
-            if (!success)
-            {
-                ESPLogger::error("Failed to publish telemetry: %s", point.name.c_str());
-            }
+            continue;
         }
+
+        // Use new generic topic structure for telemetry
+        if (!mqtt.publishTelemetry(point.name, point.value, point.unit, true))
+        {
+            if (failed == 0)
+            {
+                // Safe to hold: `points` outlives this loop, so the String's
+                // buffer stays valid. Avoids a copy in the failure path.
+                firstFailure = point.name.c_str();
+            }
+            failed++;
+        }
+    }
+
+    if (failed > 0)
+    {
+        ESPLogger::error("Failed to publish %u of %u telemetry point(s), first: %s",
+                         failed, (unsigned)points.size(),
+                         firstFailure ? firstFailure : "?");
     }
 }
 
