@@ -7,6 +7,7 @@
 #include <ESPLogger.h>
 
 #include "Config.h"
+#include "LogStore.h"
 #include "WiFiManager.h"
 #include "WebUI.h"
 #include "MQTTClient.h"
@@ -49,6 +50,14 @@ void setup()
 {
     Serial.begin(115200);
     delay(1000);
+
+    // First thing after the UART, and deliberately before ESPLogger::begin():
+    // everything logged from here on - LittleFS mount, config load,
+    // wifiManager.begin() - lands in RTC RAM and survives into the next boot.
+    // WebUI registers its own sink much later (main.cpp calls webUI.begin()
+    // below), which is precisely why an early boot hang used to leave no record.
+    LogStore::begin();
+    ESPLogger::addLogCallback(LogStore::sink);
 
     ESPLogger::begin(); // Initialize ESPLogger first
     ESPLogger::info("Starting Modbus Bridge...");

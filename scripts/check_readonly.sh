@@ -19,7 +19,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 # Search only first-party source. Excludes vendored libs, .pio, tests-of-write-detection.
-SEARCH_PATHS=(src lib/modbus_client lib/poller lib/inverters lib/meters lib/inverter_core lib/mqtt_client lib/wifi_manager lib/webui lib/config)
+SEARCH_PATHS=(src lib/modbus_client lib/poller lib/inverters lib/meters lib/inverter_core lib/mqtt_client lib/wifi_manager lib/webui lib/config lib/log_store)
 
 PATTERN_OPCODES='\b(0x05|0x06|0x0F|0x10)\b'
 PATTERN_METHODS='write(SingleCoil|SingleRegister|MultipleCoils|MultipleRegisters|Coil|Register)\s*\('

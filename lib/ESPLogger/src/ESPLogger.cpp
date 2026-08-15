@@ -1,7 +1,9 @@
 #include "ESPLogger.h"
 
 ESPLogger::LogLevel ESPLogger::currentLevel = ESPLogger::INFO;
-ESPLogger::LogCallback ESPLogger::logCallback = nullptr;
+ESPLogger::LogCallback ESPLogger::logCallbacks[ESPLogger::LOG_MAX_SINKS] = {};
+volatile uint8_t ESPLogger::sinkCount = 0;
+const uint8_t ESPLogger::LOG_MAX_SINKS;
 
 void ESPLogger::begin(LogLevel level)
 {
@@ -22,14 +24,70 @@ ESPLogger::LogLevel ESPLogger::getLevel()
     return currentLevel;
 }
 
+bool ESPLogger::addLogCallback(LogCallback callback)
+{
+    if (callback == nullptr)
+    {
+        return false;
+    }
+
+    for (uint8_t i = 0; i < sinkCount; i++)
+    {
+        if (logCallbacks[i] == callback)
+        {
+            return false; // already registered
+        }
+    }
+
+    if (sinkCount >= LOG_MAX_SINKS)
+    {
+        return false;
+    }
+
+    // Publish-after-write: the slot must be valid before sinkCount exposes it,
+    // or a print() racing us on the other core could call through a stale
+    // pointer. Ordering matters here; do not merge these two statements.
+    logCallbacks[sinkCount] = callback;
+    sinkCount = sinkCount + 1;
+    return true;
+}
+
+bool ESPLogger::removeLogCallback(LogCallback callback)
+{
+    for (uint8_t i = 0; i < sinkCount; i++)
+    {
+        if (logCallbacks[i] != callback)
+        {
+            continue;
+        }
+
+        // Shrink the count first so a concurrent print() stops iterating the
+        // tail slot before we move anything into it.
+        uint8_t last = sinkCount - 1;
+        sinkCount = last;
+        logCallbacks[i] = logCallbacks[last];
+        logCallbacks[last] = nullptr;
+        return true;
+    }
+    return false;
+}
+
 void ESPLogger::setLogCallback(LogCallback callback)
 {
-    logCallback = callback;
+    removeLogCallback();
+    if (callback != nullptr)
+    {
+        addLogCallback(callback);
+    }
 }
 
 void ESPLogger::removeLogCallback()
 {
-    logCallback = nullptr;
+    sinkCount = 0;
+    for (uint8_t i = 0; i < LOG_MAX_SINKS; i++)
+    {
+        logCallbacks[i] = nullptr;
+    }
 }
 
 const char *ESPLogger::logLevelToString(LogLevel level)
@@ -90,16 +148,27 @@ void ESPLogger::print(LogLevel level, const char *message)
 {
     if (level <= currentLevel)
     {
+        // One millis() read for both Serial and the sinks, so a line's serial
+        // timestamp and its stored timestamp always agree.
+        unsigned long ts = millis();
+
         // Using only ESPLogger for output, no Serial.println [[memory:6293639]]
         // Output to Serial for debugging, but callback is the primary output
         Serial.printf("[%lu][%s] %s\n",
-                      millis(),
+                      ts,
                       getLevelString(level),
                       message);
 
-        if (logCallback != nullptr)
+        // Snapshot the count once: a sink registering mid-loop must not extend
+        // this iteration. Deliberately unlocked — see the note in the header.
+        uint8_t count = sinkCount;
+        for (uint8_t i = 0; i < count; i++)
         {
-            logCallback(level, message, millis());
+            LogCallback cb = logCallbacks[i];
+            if (cb != nullptr)
+            {
+                cb(level, message, ts);
+            }
         }
     }
 }

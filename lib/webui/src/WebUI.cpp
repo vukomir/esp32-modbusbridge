@@ -1,5 +1,6 @@
 #include "WebUI.h"
 #include "ModbusClient.h"
+#include "LogStore.h"
 #include <ESPLogger.h>
 #include "constants.h"
 #include <Update.h>
@@ -45,9 +46,10 @@ bool WebUI::begin(uint16_t port)
     ESPLogger::info("Web UI starting on port %d...", port);
     ESPLogger::info("Free heap before WebUI init: %u bytes", ESP.getFreeHeap());
 
-    // Initialize log buffer
+    // Initialize log buffer. addLogCallback, not setLogCallback: LogStore
+    // registered its own sink back in setup() and must not be evicted here.
     logStartTime = millis();
-    ESPLogger::setLogCallback(logCallback);
+    ESPLogger::addLogCallback(logCallback);
 
     // Generate CSRF token for this boot. Token lifetime = uptime; any open
     // browser tab from a previous boot will get a 403 on POST and need to reload.
@@ -75,6 +77,8 @@ bool WebUI::begin(uint16_t port)
               { handleConsole(); });
     server.on("/api/logs", HTTP_GET, [this]()
               { handleLogsAPI(); });
+    server.on("/api/logs/download", HTTP_GET, [this]()
+              { handleLogDownload(); });
     server.on("/api/log/config", HTTP_POST, [this]()
               { handleLogConfig(); });
     server.on("/api/status", HTTP_GET, [this]()
@@ -479,6 +483,80 @@ void WebUI::handleLogsAPI()
     server.send(200, "application/json", json);
 }
 
+// GET /api/logs/download - the RTC-backed log ring as a plain text file.
+//
+// This is the only chunked response in the web UI. The payload is only ~8KB and
+// a single String would fit in today's heap, but reserve() fails silently and
+// handleLogsAPI() above already carries the scar tissue from that ("Send only
+// recent logs to prevent memory issues", capping itself at 20 entries).
+// Streaming also costs nothing extra in latency: webTask's 20ms vTaskDelay sits
+// between handleClient() calls, not between sendContent() calls.
+//
+// No CSRF: it is a GET with no side effects, matching /api/logs and
+// /api/status. Note the whole web UI is unauthenticated, so this endpoint is no
+// more exposed than /api/status - which already returns the SSID and IP.
+void WebUI::handleLogDownload()
+{
+    server.sendHeader("X-Content-Type-Options", "nosniff");
+    server.sendHeader("X-Frame-Options", "DENY");
+    server.sendHeader("Cache-Control", "no-store");
+
+    char filename[96];
+    snprintf(filename, sizeof(filename),
+             "attachment; filename=\"modbusbridge-b%lu-%lus.log\"",
+             (unsigned long)LogStore::bootCount(),
+             (unsigned long)(millis() / 1000));
+    server.sendHeader("Content-Disposition", filename);
+
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/plain", "");
+
+    // Preamble: the context you would otherwise have to ask the user for.
+    char pre[512];
+    int n = snprintf(pre, sizeof(pre),
+                     "# Modbus Bridge log dump\n"
+                     "# firmware   : %s (%s, %s)\n"
+                     "# device id  : %s\n"
+                     "# boot count : %lu\n"
+                     "# last reset : %s\n"
+                     "# uptime     : %lu s\n"
+                     "# free heap  : %u bytes\n"
+                     "# ring used  : %u / %u bytes\n"
+                     "# dropped    : %lu records\n"
+                     "# timestamps are milliseconds since boot, not wall clock\n"
+                     "#\n",
+                     FIRMWARE_VERSION, GIT_BRANCH, GIT_HASH,
+                     wifiManager.getDeviceId().c_str(),
+                     (unsigned long)LogStore::bootCount(),
+                     LogStore::resetReasonStr(),
+                     (unsigned long)(millis() / 1000),
+                     ESP.getFreeHeap(),
+                     LogStore::usedBytes(), LogStore::capacityBytes(),
+                     (unsigned long)LogStore::droppedRecords());
+    if (n > 0)
+    {
+        server.sendContent(pre, (size_t)n < sizeof(pre) ? (size_t)n : sizeof(pre) - 1);
+    }
+
+    // One record at a time into a stack buffer. LogStore takes the lock per
+    // record and releases it before we touch the network.
+    char line[LOG_STORE_MAX_MSG + 64];
+    size_t written = 0;
+    LogStore::Cursor cursor = LogStore::openRead();
+    while (LogStore::next(cursor, line, sizeof(line), written))
+    {
+        server.sendContent(line, written);
+    }
+
+    if (cursor.overrun)
+    {
+        const char *warn = "# --- log overrun during read, older entries lost ---\n";
+        server.sendContent(warn, strlen(warn));
+    }
+
+    server.sendContent(""); // terminate chunked encoding
+}
+
 void WebUI::onWebSocketEventStatic(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
 {
     if (instance != nullptr)
@@ -538,13 +616,11 @@ void WebUI::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_
             }
         }
 
-        // Clear old logs from buffer to force fresh timestamps
-        if (logBufferCount > 5)
-        {
-            ESPLogger::info("Clearing old log buffer for fresh NTP timestamps");
-            logBufferCount = 0;
-            logBufferIndex = 0;
-        }
+        // NOTE: this used to wipe the log buffer here "for fresh NTP
+        // timestamps", which meant opening the console destroyed the very
+        // history you opened it to read. Removed. Entries logged before NTP
+        // sync carry a millis() timestamp and the client already distinguishes
+        // them via the "ntp" flag below.
 
         // Send welcome message with system info
         String welcomeMsg = "{\"type\":\"welcome\",\"message\":\"Connected to " + String(DEVICE_NAME) +
@@ -561,27 +637,33 @@ void WebUI::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_
         String initMsg = "{\"type\":\"init\",\"message\":\"" + debugInfo + "\"}";
         wsServer.sendTXT(num, initMsg);
 
-        // Send only the most recent log entry if available
-        if (logBufferCount > 0)
+        // Replay recent history so a freshly opened console is not blank.
+        // Capped well below LOG_BUFFER_SIZE: each entry is a handful of
+        // transient Strings, and this runs inside the WebSocket event handler
+        // on webTask. For anything older, use /api/logs/download.
         {
-            int lastIndex = (logBufferIndex - 1 + LOG_BUFFER_SIZE) % LOG_BUFFER_SIZE;
-            const LogEntry &entry = logBuffer[lastIndex];
-
-            // Use timestamp directly from log buffer (already converted in logCallback)
-            uint64_t realTime = entry.timestamp;
+            const int replayCount = min(logBufferCount, 10);
+            const int firstIndex =
+                (logBufferIndex - replayCount + LOG_BUFFER_SIZE) % LOG_BUFFER_SIZE;
             time_t now = time(nullptr);
-            bool useNTP = (now > 1000000000) && (realTime > 1000000000000ULL); // Check if timestamp is Unix time
 
-            // Build JSON safely with proper escaping
-            String escapedMessage = escapeJsonString(String(entry.message));
+            for (int i = 0; i < replayCount; i++)
+            {
+                const LogEntry &entry = logBuffer[(firstIndex + i) % LOG_BUFFER_SIZE];
 
-            String json = "{\"type\":\"log\",";
-            json += "\"timestamp\":" + String((uint64_t)realTime) + ",";
-            json += "\"level\":\"" + String(ESPLogger::logLevelToString(entry.level)) + "\",";
-            json += "\"message\":\"" + escapedMessage + "\",";
-            json += "\"ntp\":" + String(useNTP ? "true" : "false") + "}";
+                // Timestamps are already converted in logCallback; magnitude
+                // tells us whether this one is Unix ms or raw millis().
+                uint64_t realTime = entry.timestamp;
+                bool useNTP = (now > 1000000000) && (realTime > 1000000000000ULL);
 
-            wsServer.sendTXT(num, json);
+                String json = "{\"type\":\"log\",";
+                json += "\"timestamp\":" + String((uint64_t)realTime) + ",";
+                json += "\"level\":\"" + String(ESPLogger::logLevelToString(entry.level)) + "\",";
+                json += "\"message\":\"" + escapeJsonString(String(entry.message)) + "\",";
+                json += "\"ntp\":" + String(useNTP ? "true" : "false") + "}";
+
+                wsServer.sendTXT(num, json);
+            }
         }
         break;
     }
@@ -1199,8 +1281,11 @@ String WebUI::getCSS()
            "input[type=checkbox]{width:auto;margin-right:0.5rem}"
            ".checkbox-group{display:flex;align-items:center;gap:0.5rem}"
            ".button-group{display:flex;gap:0.75rem;justify-content:center;margin:1.5rem 0}"
-           "button{padding:0.75rem 1.5rem;border:none;border-radius:0.375rem;cursor:pointer;font-size:0.875rem;font-weight:500;transition:all 0.2s;text-decoration:none;display:inline-flex;align-items:center;gap:0.5rem}"
-           "button:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,0.15)}"
+           // .btn-anchor lets an <a> pick up the button box model. Without it an
+           // anchor matches only the colour classes below, so it renders with no
+           // padding and its label sits off-centre next to real buttons.
+           "button,.btn-anchor{padding:0.75rem 1.5rem;border:none;border-radius:0.375rem;cursor:pointer;font-size:0.875rem;font-weight:500;transition:all 0.2s;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:0.5rem;line-height:1;box-sizing:border-box}"
+           "button:hover,.btn-anchor:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,0.15)}"
            ".btn-primary{background:var(--primary);color:white}"
            ".btn-primary:hover{background:var(--primary-dark)}"
            ".btn-secondary{background:#6b7280;color:white}"
@@ -1236,7 +1321,7 @@ String WebUI::getCSS()
              ".nav.open{display:flex}"
              ".nav a{flex:none;width:100%;text-align:left;padding:0.75rem 1rem;font-size:1rem;border-radius:0.375rem}"
              ".button-group{flex-direction:column;gap:0.5rem}"
-             ".button-group button{width:100%;justify-content:center}"
+             ".button-group button,.button-group .btn-anchor{width:100%;justify-content:center}"
              ".status-grid{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}"
              ".status-value{font-size:1.25rem}"
              // 16px font-size on inputs prevents iOS Safari auto-zoom on focus.
@@ -1753,7 +1838,14 @@ String WebUI::generateConsolePage()
     html += "<button id='clearBtn' class='btn-secondary'>🗑️ Clear</button>";
     html += "<button id='scrollBtn' class='btn-secondary'>📜 Follow: ON</button>";
     html += "<button id='bottomBtn' class='btn-secondary'>⬇️ Bottom</button>";
+    // Plain link, not fetch(): the browser handles Content-Disposition itself,
+    // and this works even when the WebSocket console cannot connect.
+    html += "<a href='/api/logs/download' class='btn-anchor btn-secondary'>💾 Download log</a>";
     html += "<span id='connectionStatus' style='margin-left:1rem;font-weight:bold;color:#6b7280;'>Connecting...</span>";
+    html += "</div>";
+    html += "<div style='font-size:0.8125rem;color:var(--text-light);margin-top:-0.5rem;'>";
+    html += "The download covers boot #" + String(LogStore::bootCount());
+    html += " and earlier sessions held in RTC memory (survives reboots and crashes, not a power cut).";
     html += "</div>";
 
     // Console output area with scroll indicator

@@ -32,10 +32,24 @@ void testLogCallback(ESPLogger::LogLevel level, const char *message, unsigned lo
     logCallbackCalled = true;
 }
 
+// Second sink, used only by the multi-sink tests below.
+String secondCapturedLog;
+bool secondCallbackCalled;
+
+void secondLogCallback(ESPLogger::LogLevel level, const char *message, unsigned long timestamp)
+{
+    (void)level;
+    (void)timestamp;
+    secondCapturedLog = String(message);
+    secondCallbackCalled = true;
+}
+
 void setUp(void)
 {
     capturedLog = "";
     logCallbackCalled = false;
+    secondCapturedLog = "";
+    secondCallbackCalled = false;
     ESPLogger::setLogCallback(testLogCallback);
 }
 
@@ -141,6 +155,42 @@ void test_message_content()
     TEST_ASSERT_TRUE(capturedLog.indexOf(testMessage) >= 0);
 }
 
+// Both registered sinks must receive every line. This is the property the
+// WebUI console and LogStore depend on to coexist.
+void test_multiple_sinks_both_fire()
+{
+    ESPLogger::setLevel(ESPLogger::INFO);
+    TEST_ASSERT_TRUE(ESPLogger::addLogCallback(secondLogCallback));
+
+    ESPLogger::info("Broadcast to both");
+
+    TEST_ASSERT_TRUE(logCallbackCalled);
+    TEST_ASSERT_TRUE(secondCallbackCalled);
+    TEST_ASSERT_TRUE(capturedLog.indexOf("Broadcast to both") >= 0);
+    TEST_ASSERT_TRUE(secondCapturedLog.indexOf("Broadcast to both") >= 0);
+
+    // Slots are finite and duplicates are rejected rather than silently
+    // consuming a slot.
+    TEST_ASSERT_FALSE(ESPLogger::addLogCallback(secondLogCallback));
+    TEST_ASSERT_FALSE(ESPLogger::addLogCallback(nullptr));
+}
+
+// Removing one sink by identity must leave the other registered — the failure
+// mode this whole change exists to prevent.
+void test_remove_single_sink_leaves_other()
+{
+    ESPLogger::setLevel(ESPLogger::INFO);
+    TEST_ASSERT_TRUE(ESPLogger::addLogCallback(secondLogCallback));
+
+    TEST_ASSERT_TRUE(ESPLogger::removeLogCallback(secondLogCallback));
+    TEST_ASSERT_FALSE(ESPLogger::removeLogCallback(secondLogCallback)); // already gone
+
+    ESPLogger::info("Only the first sink");
+
+    TEST_ASSERT_TRUE(logCallbackCalled);
+    TEST_ASSERT_FALSE(secondCallbackCalled);
+}
+
 void setup()
 {
     delay(2000); // Wait for serial monitor
@@ -154,6 +204,8 @@ void setup()
     RUN_TEST(test_formatted_logging);
     RUN_TEST(test_callback_functionality);
     RUN_TEST(test_message_content);
+    RUN_TEST(test_multiple_sinks_both_fire);
+    RUN_TEST(test_remove_single_sink_leaves_other);
 
     UNITY_END();
 }

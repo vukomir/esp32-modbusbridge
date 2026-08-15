@@ -6,6 +6,9 @@
 #include <stdint.h>
 #include <string>
 #include <cstring>
+#include <cstdarg>
+#include <cstdio>
+#include <cctype>
 #include <iostream>
 #include <chrono>
 #include <thread>
@@ -82,6 +85,14 @@ public:
         return pos == std::string::npos ? -1 : static_cast<int>(pos);
     }
     
+    // Case conversion (mutates in place, like the Arduino String API)
+    void toLowerCase() {
+        for (auto& c : str) c = static_cast<char>(::tolower((unsigned char)c));
+    }
+    void toUpperCase() {
+        for (auto& c : str) c = static_cast<char>(::toupper((unsigned char)c));
+    }
+
     // Concatenation methods (for ArduinoJson compatibility)
     bool concat(const String& s) { str += s.str; return true; }
     bool concat(const char* s) { if (s) str += s; return true; }
@@ -169,6 +180,20 @@ public:
     size_t write(const char* str) { return write((const uint8_t*)str, strlen(str)); }
     void flush() {}
     int peek() override { return -1; }
+
+    // ESPLogger emits every line through Serial.printf, so the mock needs it or
+    // nothing that logs will build natively.
+    size_t printf(const char* format, ...) {
+        char buffer[256];
+        va_list args;
+        va_start(args, format);
+        int n = vsnprintf(buffer, sizeof(buffer), format, args);
+        va_end(args);
+        if (n <= 0) return 0;
+        size_t len = (size_t)n < sizeof(buffer) ? (size_t)n : sizeof(buffer) - 1;
+        std::cout << buffer;
+        return len;
+    }
 };
 
 extern MockSerial Serial;
@@ -199,18 +224,34 @@ void pinMode(uint8_t pin, uint8_t mode);
 void digitalWrite(uint8_t pin, uint8_t value);
 int digitalRead(uint8_t pin);
 
-// Memory functions
-void* malloc(size_t size);
-void free(void* ptr);
+// NOTE: do NOT mock malloc/free here. Declaring them at global scope overrides
+// libc's, and since std::malloc IS ::malloc the forwarding definition calls
+// itself. On Linux's flat ELF namespace our symbol preempts glibc's, so every
+// allocation in the program - static init included - recurses until the stack
+// dies. macOS binds libSystem's internal calls directly and never notices,
+// which is why this passed locally and segfaulted in CI. The real ones work
+// fine; nothing needs them stubbed.
 
-// Math functions
-#ifndef min
-#define min(a,b) ((a)<(b)?(a):(b))
+// Math functions.
+//
+// Templates, not macros, deliberately. A function-like min()/max() macro
+// rewrites any later declaration of std::min/std::max, so every libstdc++
+// header pulled in after this one fails to parse. libc++ on macOS happens to
+// tolerate it and libstdc++ on Linux does not, which is why this only appeared
+// once the native build started compiling in CI. Do not turn these back into
+// macros.
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
 #endif
 
-#ifndef max  
-#define max(a,b) ((a)>(b)?(a):(b))
-#endif
+template <typename T, typename U>
+inline auto min(T a, U b) -> decltype(a < b ? a : b) { return a < b ? a : b; }
+
+template <typename T, typename U>
+inline auto max(T a, U b) -> decltype(a > b ? a : b) { return a > b ? a : b; }
 
 // NaN handling
 #ifndef NAN

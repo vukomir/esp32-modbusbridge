@@ -52,17 +52,22 @@ int digitalRead(uint8_t pin) {
     return (it != pinStates.end()) ? it->second : LOW;
 }
 
-void* malloc(size_t size) {
-    return std::malloc(size);
-}
-
-void free(void* ptr) {
-    std::free(ptr);
-}
-
 void yield() {
     // Allow other threads to run
     std::this_thread::yield();
 }
+
+#ifdef UNIT_TEST
+// Every suite in test/ is written Arduino-style: it runs UNITY_BEGIN() ..
+// UNITY_END() inside setup() and leaves loop() empty. A native binary needs a
+// real entry point, so call setup() once and exit. PlatformIO reads the pass/
+// fail counts from Unity's stdout, so the exit code does not carry the verdict.
+extern void setup();
+
+int main(int, char **) {
+    setup();
+    return 0;
+}
+#endif // UNIT_TEST
 
 #endif // NATIVE_BUILD
