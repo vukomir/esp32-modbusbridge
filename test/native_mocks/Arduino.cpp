@@ -52,14 +52,6 @@ int digitalRead(uint8_t pin) {
     return (it != pinStates.end()) ? it->second : LOW;
 }
 
-void* malloc(size_t size) {
-    return std::malloc(size);
-}
-
-void free(void* ptr) {
-    std::free(ptr);
-}
-
 void yield() {
     // Allow other threads to run
     std::this_thread::yield();

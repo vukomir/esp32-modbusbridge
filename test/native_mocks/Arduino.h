@@ -224,9 +224,13 @@ void pinMode(uint8_t pin, uint8_t mode);
 void digitalWrite(uint8_t pin, uint8_t value);
 int digitalRead(uint8_t pin);
 
-// Memory functions
-void* malloc(size_t size);
-void free(void* ptr);
+// NOTE: do NOT mock malloc/free here. Declaring them at global scope overrides
+// libc's, and since std::malloc IS ::malloc the forwarding definition calls
+// itself. On Linux's flat ELF namespace our symbol preempts glibc's, so every
+// allocation in the program - static init included - recurses until the stack
+// dies. macOS binds libSystem's internal calls directly and never notices,
+// which is why this passed locally and segfaulted in CI. The real ones work
+// fine; nothing needs them stubbed.
 
 // Math functions.
 //
