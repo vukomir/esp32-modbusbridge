@@ -17,7 +17,6 @@ MQTTClient::~MQTTClient()
 bool MQTTClient::begin()
 {
     ESPLogger::info("Initializing MQTT client...");
-    ESPLogger::info("Free heap before MQTT init: %u bytes", ESP.getFreeHeap());
 
     if (!validateMQTTConfig())
     {

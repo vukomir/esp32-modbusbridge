@@ -106,21 +106,15 @@ void setup()
     }
     webUI.begin(80);
 
-    // ESP32 has plenty of memory - enable all components
-    ESPLogger::info("ESP32 detected - enabling all components");
-
     mqttClient.begin();
     modbusClient.begin();
 
     poller.begin();
 
-    ESPLogger::info("");
-    ESPLogger::info("All components enabled!");
-    ESPLogger::info("- ESP32 D2 (GPIO4) → MAX485 DE/RE");
-    ESPLogger::info("- ESP32 D16 (GPIO16) → MAX485 RO");
-    ESPLogger::info("- ESP32 D17 (GPIO17) → MAX485 DI");
-    ESPLogger::info("- ESP32 D21 (GPIO21) → Factory Reset Button");
-    ESPLogger::info("- Connect MAX485 A/B to device RS485 terminals");
+    // The pin map is static text that never varies between boots, so it is one
+    // line rather than five. Everything logged during setup() competes for the
+    // protected boot segment in RTC memory (see lib/log_store).
+    ESPLogger::info("Wiring: MAX485 DE/RE=GPIO4, RO=GPIO16, DI=GPIO17, factory reset=GPIO21");
 
     ESPLogger::info("=== System Ready ===");
     if (wifiManager.isConnected())
@@ -132,20 +126,16 @@ void setup()
         ESPLogger::info("Connect to AP: %s and go to http://192.168.4.1/", wifiManager.getDeviceId().c_str());
     }
 
-    // Create optimized FreeRTOS tasks for ESP32 dual-core architecture
-    ESPLogger::info("Creating FreeRTOS tasks...");
-    ESPLogger::info("Free heap before task creation: %u bytes", ESP.getFreeHeap());
-
-    // Create all FreeRTOS tasks with optimized stack sizes
-    ESPLogger::info("Creating all FreeRTOS tasks with optimized stacks...");
+    // Create optimized FreeRTOS tasks for ESP32 dual-core architecture.
+    // One summary line after the fact rather than a line per task: the stack
+    // and core assignments are fixed at compile time, and statusTask reports
+    // live high-water marks every 30s anyway.
 
     // Core 1: WebSocket/HTTP with larger stack for WebSocket operations
     xTaskCreatePinnedToCore(webTask, "WebTask", 6144, NULL, 1, &webTaskHandle, 1);
-    ESPLogger::info("WebTask created on Core 1 (6KB stack)");
 
     // Core 0: MQTT (network I/O, medium priority)
     xTaskCreatePinnedToCore(mqttTask, "MQTTTask", 4096, NULL, 2, &mqttTaskHandle, 0);
-    ESPLogger::info("MQTTTask created on Core 0 (4KB stack)");
 
     // Core 0: Modbus polling (I/O intensive, higher priority)
     // 6KB stack: 4KB was the original budget for SolplanetASW's 23-register block reads.
@@ -153,19 +143,17 @@ void setup()
     // stack buffer plus deeper call chain (decodeValue, std::vector pushes, String
     // allocations), so we lift the ceiling to 6KB. RAM cost: +2KB permanently.
     xTaskCreatePinnedToCore(pollerTask, "PollerTask", 6144, NULL, 3, &pollerTaskHandle, 0);
-    ESPLogger::info("PollerTask created on Core 0 (6KB stack)");
 
     // Core 1: Status reporting (low priority, background)
     xTaskCreatePinnedToCore(statusTask, "StatusTask", 4096, NULL, 1, &statusTaskHandle, 1);
-    ESPLogger::info("StatusTask created on Core 1 (4KB stack)");
 
     // Core 1: Button monitoring (low priority, small stack)
     xTaskCreatePinnedToCore(buttonTask, "ButtonTask", 2048, NULL, 1, &buttonTaskHandle, 1);
-    ESPLogger::info("ButtonTask created on Core 1 (2KB stack)");
 
-    ESPLogger::info("All tasks created successfully!");
     // 6 (web) + 4 (mqtt) + 6 (poller) + 4 (status) + 2 (button) = 22 KB
-    ESPLogger::info("Total stack allocated: 22KB, Final heap: %u bytes", ESP.getFreeHeap());
+    ESPLogger::info("Tasks started: web/6K+status/4K+button/2K on core 1, "
+                    "mqtt/4K+poller/6K on core 0. Final heap: %u bytes",
+                    ESP.getFreeHeap());
 }
 
 void loop()
