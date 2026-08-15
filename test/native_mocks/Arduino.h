@@ -228,14 +228,26 @@ int digitalRead(uint8_t pin);
 void* malloc(size_t size);
 void free(void* ptr);
 
-// Math functions
-#ifndef min
-#define min(a,b) ((a)<(b)?(a):(b))
+// Math functions.
+//
+// Templates, not macros, deliberately. A function-like min()/max() macro
+// rewrites any later declaration of std::min/std::max, so every libstdc++
+// header pulled in after this one fails to parse. libc++ on macOS happens to
+// tolerate it and libstdc++ on Linux does not, which is why this only appeared
+// once the native build started compiling in CI. Do not turn these back into
+// macros.
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
 #endif
 
-#ifndef max  
-#define max(a,b) ((a)>(b)?(a):(b))
-#endif
+template <typename T, typename U>
+inline auto min(T a, U b) -> decltype(a < b ? a : b) { return a < b ? a : b; }
+
+template <typename T, typename U>
+inline auto max(T a, U b) -> decltype(a > b ? a : b) { return a > b ? a : b; }
 
 // NaN handling
 #ifndef NAN
