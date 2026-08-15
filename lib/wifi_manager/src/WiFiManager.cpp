@@ -25,7 +25,6 @@ bool WiFiManager::begin()
     }
 
     ESPLogger::info("WiFi manager starting...");
-    ESPLogger::info("Free heap before WiFi init: %u bytes", ESP.getFreeHeap());
 
     WiFi.mode(WIFI_OFF);
     delay(100);
@@ -33,16 +32,16 @@ bool WiFiManager::begin()
     // Try STA mode first
     if (connectSTA())
     {
-        ESPLogger::info("🎉 WiFi connection established in begin()");
-        ESPLogger::info("📡 SSID: %s", getSSID().c_str());
-        ESPLogger::info("🌐 IP: %s (via getIPAddress())", getIPAddress().c_str());
-        ESPLogger::info("📍 Direct IP: %s (via WiFi.localIP())", WiFi.localIP().toString().c_str());
-        ESPLogger::info("🔗 WiFi Status: %d", WiFi.status());
-        ESPLogger::info("📊 AP Mode: %s", apMode ? "true" : "false");
-        ESPLogger::info("🔧 Is Connected: %s", isConnected() ? "true" : "false");
-        ESPLogger::info("WiFi manager started successfully");
-        ESPLogger::info("Free heap after WiFi init: %u bytes", ESP.getFreeHeap());
+        // Set this BEFORE logging isConnected(). It is one of the three terms in
+        // isConnected(), so logging first printed "Is Connected: false" directly
+        // under "connection established" - which is exactly the misleading
+        // signature that made a real WiFi-init bug hard to read.
         initialized = true;
+
+        // connectSTA() already logged SSID, IP, gateway and DNS; repeating them
+        // here cost seven records of the protected boot segment for nothing.
+        ESPLogger::info("🎉 WiFi manager started (status=%d, connected=%s, heap=%u)",
+                        WiFi.status(), isConnected() ? "true" : "false", ESP.getFreeHeap());
         return true;
     }
 

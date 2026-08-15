@@ -20,7 +20,6 @@ bool ModbusClient::begin()
     }
 
     ESPLogger::info("Initializing Modbus client...");
-    ESPLogger::info("Free heap before Modbus init: %u bytes", ESP.getFreeHeap());
 
     // Get configuration
     baudrate = getBaudrateValue();

@@ -25,7 +25,6 @@ bool Poller::begin()
     }
 
     ESPLogger::info("Initializing Poller...");
-    ESPLogger::info("Free heap before Poller init: %u bytes", ESP.getFreeHeap());
 
     if (!modbus.isInitialized())
     {

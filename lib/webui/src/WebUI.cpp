@@ -44,7 +44,6 @@ bool WebUI::begin(uint16_t port)
     }
 
     ESPLogger::info("Web UI starting on port %d...", port);
-    ESPLogger::info("Free heap before WebUI init: %u bytes", ESP.getFreeHeap());
 
     // Initialize log buffer. addLogCallback, not setLogCallback: LogStore
     // registered its own sink back in setup() and must not be evicted here.
