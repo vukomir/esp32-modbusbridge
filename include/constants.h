@@ -22,6 +22,15 @@
 #define GIT_BRANCH "unknown"
 #endif
 
+// Where users download release firmware (.bin) for manual upload on /update.
+// The device deliberately does NOT fetch this itself. Measured on this repo:
+// linking HTTPClient + WiFiClientSecure to query the GitHub API costs
+// +146,344 bytes of flash (of which mbedTLS alone is +122,720), taking the
+// app partition from 86.1% to 97.3% of its 0x140000 bytes. The user's browser
+// already has internet; it follows this link instead. Enforced by
+// scripts/check_release_link.sh.
+#define FIRMWARE_RELEASES_URL "https://github.com/vukomir/esp32-modbusbridge/releases"
+
 // Build information from C++ built-ins
 #define BUILD_DATE __DATE__
 #define BUILD_TIME __TIME__

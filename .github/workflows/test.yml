@@ -192,6 +192,9 @@ jobs:
     - name: Read-only Modbus invariant check
       run: bash scripts/check_readonly.sh
 
+    - name: Firmware download link check
+      run: bash scripts/check_release_link.sh
+
     - name: Static Analysis
       run: pio check --skip-packages
       continue-on-error: true
