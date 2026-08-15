@@ -318,6 +318,16 @@ void LogStore::begin()
              FIRMWARE_VERSION,
              GIT_HASH);
     sink(ESPLogger::INFO, marker, 0);
+
+    // And a copy into the rolling ring. Once the boot segment fills, the rest
+    // of this boot overflows into rolling and lands directly after the previous
+    // session's records - so timestamps appear to run backwards mid-section
+    // with nothing explaining why. This one record marks the seam.
+    LS_LOCK_ENTER(g_mux);
+    appendCircular(g_region.roll, (uint8_t)ESPLogger::INFO, FLAG_BOOT, 0,
+                   marker, (uint16_t)strlen(marker), g_region.dropped);
+    g_region.seq++;
+    LS_LOCK_EXIT(g_mux);
 }
 
 bool LogStore::shouldCapture(ESPLogger::LogLevel level, unsigned long nowMs)

@@ -224,6 +224,12 @@ void statusTask(void *parameter)
 {
     for (;;)
     {
+        // Wait first, report second. The old order fired this ~3s into boot,
+        // putting seven records of routine periodic output straight into the
+        // protected boot segment for no benefit - heap and stack high-water
+        // marks that early are not yet meaningful anyway.
+        vTaskDelay(pdMS_TO_TICKS(30000));
+
         // Memory status
         ESPLogger::info("Status - Free heap: %d bytes", ESP.getFreeHeap());
 
@@ -258,8 +264,6 @@ void statusTask(void *parameter)
         {
             ESPLogger::info("MQTT: Connected");
         }
-
-        vTaskDelay(pdMS_TO_TICKS(30000)); // 30 second delay
     }
 }
 
