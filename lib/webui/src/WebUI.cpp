@@ -1281,8 +1281,11 @@ String WebUI::getCSS()
            "input[type=checkbox]{width:auto;margin-right:0.5rem}"
            ".checkbox-group{display:flex;align-items:center;gap:0.5rem}"
            ".button-group{display:flex;gap:0.75rem;justify-content:center;margin:1.5rem 0}"
-           "button{padding:0.75rem 1.5rem;border:none;border-radius:0.375rem;cursor:pointer;font-size:0.875rem;font-weight:500;transition:all 0.2s;text-decoration:none;display:inline-flex;align-items:center;gap:0.5rem}"
-           "button:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,0.15)}"
+           // .btn-anchor lets an <a> pick up the button box model. Without it an
+           // anchor matches only the colour classes below, so it renders with no
+           // padding and its label sits off-centre next to real buttons.
+           "button,.btn-anchor{padding:0.75rem 1.5rem;border:none;border-radius:0.375rem;cursor:pointer;font-size:0.875rem;font-weight:500;transition:all 0.2s;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:0.5rem;line-height:1;box-sizing:border-box}"
+           "button:hover,.btn-anchor:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,0.15)}"
            ".btn-primary{background:var(--primary);color:white}"
            ".btn-primary:hover{background:var(--primary-dark)}"
            ".btn-secondary{background:#6b7280;color:white}"
@@ -1318,7 +1321,7 @@ String WebUI::getCSS()
              ".nav.open{display:flex}"
              ".nav a{flex:none;width:100%;text-align:left;padding:0.75rem 1rem;font-size:1rem;border-radius:0.375rem}"
              ".button-group{flex-direction:column;gap:0.5rem}"
-             ".button-group button{width:100%;justify-content:center}"
+             ".button-group button,.button-group .btn-anchor{width:100%;justify-content:center}"
              ".status-grid{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}"
              ".status-value{font-size:1.25rem}"
              // 16px font-size on inputs prevents iOS Safari auto-zoom on focus.
@@ -1837,7 +1840,7 @@ String WebUI::generateConsolePage()
     html += "<button id='bottomBtn' class='btn-secondary'>⬇️ Bottom</button>";
     // Plain link, not fetch(): the browser handles Content-Disposition itself,
     // and this works even when the WebSocket console cannot connect.
-    html += "<a href='/api/logs/download' class='btn-secondary' style='text-decoration:none;'>💾 Download log</a>";
+    html += "<a href='/api/logs/download' class='btn-anchor btn-secondary'>💾 Download log</a>";
     html += "<span id='connectionStatus' style='margin-left:1rem;font-weight:bold;color:#6b7280;'>Connecting...</span>";
     html += "</div>";
     html += "<div style='font-size:0.8125rem;color:var(--text-light);margin-top:-0.5rem;'>";
