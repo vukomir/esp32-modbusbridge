@@ -45,9 +45,10 @@ bool WebUI::begin(uint16_t port)
     ESPLogger::info("Web UI starting on port %d...", port);
     ESPLogger::info("Free heap before WebUI init: %u bytes", ESP.getFreeHeap());
 
-    // Initialize log buffer
+    // Initialize log buffer. addLogCallback, not setLogCallback: LogStore
+    // registered its own sink back in setup() and must not be evicted here.
     logStartTime = millis();
-    ESPLogger::setLogCallback(logCallback);
+    ESPLogger::addLogCallback(logCallback);
 
     // Generate CSRF token for this boot. Token lifetime = uptime; any open
     // browser tab from a previous boot will get a 403 on POST and need to reload.
