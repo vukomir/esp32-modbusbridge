@@ -42,7 +42,14 @@ A comprehensive ESP32-based monitoring system for solar inverters and smart mete
 
 Logs are captured into a ~7 KB ring buffer in the ESP32's RTC memory, starting from the first line of `setup()`. Download them from the console page or with `curl http://<device>/api/logs/download -o boot.log`.
 
-What it holds: roughly 2–3 boots' worth of history. Everything is kept for the first 60 seconds after boot; after that only `WARN` and `ERROR` are retained, so routine polling doesn't evict the startup narrative. An error briefly re-opens full capture.
+The buffer is split into two independent segments:
+
+- **Boot segment** (3.5 KB) — records from the first 60 seconds of the *current* boot. It fills once and then stops, so the earliest lines can never be pushed out by anything later, and it is cleared on each boot so it always describes the session you're looking at. Once full, further boot-window records overflow into the rolling segment rather than being lost.
+- **Rolling segment** (3.5 KB) — everything after the boot window, evicting oldest. This is where the *previous* session's final moments live after a reboot.
+
+The split exists because it was needed: with one shared ring, the known RS485 CRC noise (an `ERROR` plus a `WARN` roughly every 25 s) filled the whole buffer and evicted the startup narrative within ~16 minutes.
+
+The download presents the two as labelled sections, **not** one timeline — the rolling segment can hold records older than the boot segment.
 
 **What it survives:** `ESP.restart()`, a panic, and both watchdogs.
 **What it does not survive:** a power cut, a brownout, or an RTC-watchdog reset — which is what fires if the *bootloader* hangs. Failures before application code runs stay invisible.
