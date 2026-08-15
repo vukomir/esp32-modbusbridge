@@ -1,18 +1,13 @@
 {
     "name": "ESPLogger",
     "version": "1.0.0",
-    "description": "A flexible logging library for ESP32 with MQTT support",
-    "keywords": "logging, esp32, mqtt",
+    "description": "Leveled logging with pluggable sinks for ESP32",
+    "keywords": "logging, esp32",
     "authors": [
         {
             "name": "Vucomir Ianculov",
             "email": "vukomir@ianculov.ro"
         }
     ],
-    "license": "MIT",
-    "dependencies": {
-        "bblanchon/ArduinoJson": "^6.21.3"
-    },
-    "frameworks": "arduino",
-    "platforms": "espressif32"
+    "license": "MIT"
 }

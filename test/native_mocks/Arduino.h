@@ -6,6 +6,9 @@
 #include <stdint.h>
 #include <string>
 #include <cstring>
+#include <cstdarg>
+#include <cstdio>
+#include <cctype>
 #include <iostream>
 #include <chrono>
 #include <thread>
@@ -82,6 +85,14 @@ public:
         return pos == std::string::npos ? -1 : static_cast<int>(pos);
     }
     
+    // Case conversion (mutates in place, like the Arduino String API)
+    void toLowerCase() {
+        for (auto& c : str) c = static_cast<char>(::tolower((unsigned char)c));
+    }
+    void toUpperCase() {
+        for (auto& c : str) c = static_cast<char>(::toupper((unsigned char)c));
+    }
+
     // Concatenation methods (for ArduinoJson compatibility)
     bool concat(const String& s) { str += s.str; return true; }
     bool concat(const char* s) { if (s) str += s; return true; }
@@ -169,6 +180,20 @@ public:
     size_t write(const char* str) { return write((const uint8_t*)str, strlen(str)); }
     void flush() {}
     int peek() override { return -1; }
+
+    // ESPLogger emits every line through Serial.printf, so the mock needs it or
+    // nothing that logs will build natively.
+    size_t printf(const char* format, ...) {
+        char buffer[256];
+        va_list args;
+        va_start(args, format);
+        int n = vsnprintf(buffer, sizeof(buffer), format, args);
+        va_end(args);
+        if (n <= 0) return 0;
+        size_t len = (size_t)n < sizeof(buffer) ? (size_t)n : sizeof(buffer) - 1;
+        std::cout << buffer;
+        return len;
+    }
 };
 
 extern MockSerial Serial;
