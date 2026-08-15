@@ -219,10 +219,16 @@ void WiFiManager::handleConnection()
             }
         }
 
-        // Setup NTP if not done yet and we have a stable connection
+        // Setup NTP if not done yet and we have a stable connection. This is
+        // the fallback for a link that came up after begin() gave up; on a
+        // normal boot connectSTA() has already synced and setupNTP() returns
+        // immediately, so don't announce an attempt that isn't happening.
         if (!ntpSetupDone && currentIP != 0 && initialized)
         {
-            ESPLogger::info("🕐 Setting up NTP (delayed setup)...");
+            if (!ntpSynced)
+            {
+                ESPLogger::info("🕐 Setting up NTP (delayed setup)...");
+            }
             setupNTP();
             ntpSetupDone = true;
         }
@@ -474,6 +480,19 @@ void WiFiManager::disconnect()
 // NTP time synchronization implementation
 void WiFiManager::setupNTP()
 {
+    // Already synced - nothing to do. connectSTA() calls this on a successful
+    // connect and handleConnection() calls it again once the link is up, so
+    // every boot was configuring SNTP twice. The second pass costs a redundant
+    // configTime(), a wait of up to 10s *inside loop()* where WiFi management
+    // runs, and nine duplicate records in the protected boot log. The SDK's
+    // SNTP client keeps re-syncing on its own after the first configTime(), so
+    // one setup is all that is needed. disconnect() clears ntpSynced, which is
+    // what re-arms this after a genuine teardown.
+    if (ntpSynced)
+    {
+        return;
+    }
+
     // Check WiFi status directly and add detailed logging
     ESPLogger::info("🕐 NTP setup check - WiFi status: %d, apMode: %s, initialized: %s",
                     WiFi.status(), apMode ? "true" : "false", initialized ? "true" : "false");
