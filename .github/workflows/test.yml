@@ -33,6 +33,7 @@ jobs:
           - test_hiking_dds238
           - test_poller
           - test_generic_device
+          - test_log_store
 
     steps:
     - name: Checkout code
