@@ -241,6 +241,348 @@ void test_data_validation()
     TEST_ASSERT_EQUAL_STRING("NaN", data[1].value.c_str());
 }
 
+
+// ===========================================================================
+// Tiered polling
+//
+// These drive the driver through a scripted ModbusClient, so they need no
+// inverter and no bus: every request is recorded and answered from a table.
+// ===========================================================================
+
+struct ModbusRequest
+{
+    uint16_t reg;   // 3xxxx register number
+    uint16_t count;
+};
+
+class ScriptedModbus : public ModbusClient
+{
+public:
+    explicit ScriptedModbus(Config &cfg) : ModbusClient(cfg) {}
+
+    std::vector<ModbusRequest> requests;
+    bool silent = false;              // nothing answers at all
+    uint16_t stringCount = 2;         // value of register 31075
+    uint16_t rejectFrom = 0;          // registers [rejectFrom, rejectTo] answer with
+    uint16_t rejectTo = 0;            // a Modbus exception
+    bool rejectMerged = false;        // reads longer than 32 registers get an exception
+    uint16_t corruptAbove = 0;        // reads longer than this fail CRC (0 = never)
+
+    bool readInputRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t count,
+                            uint16_t *data, uint8_t maxAttempts = MAX_READ_ATTEMPTS) override
+    {
+        uint16_t reg = startAddr + 30001;
+        requests.push_back({reg, count});
+
+        if (silent)
+        {
+            setLastError(ModbusReadError::Timeout);
+            return false;
+        }
+        if (rejectFrom != 0 && reg <= rejectTo && reg + count - 1 >= rejectFrom)
+        {
+            setLastError(ModbusReadError::Exception, 0x02);
+            return false;
+        }
+        if (rejectMerged && count > 32)
+        {
+            setLastError(ModbusReadError::Exception, 0x02);
+            return false;
+        }
+        if (corruptAbove != 0 && count > corruptAbove)
+        {
+            setLastError(ModbusReadError::BadFrame);
+            return false;
+        }
+
+        for (uint16_t i = 0; i < count; i++)
+        {
+            uint16_t r = reg + i;
+            if (r == 31001) data[i] = '3';              // three-phase
+            else if (r == 31074) data[i] = 2;           // MPPT inputs
+            else if (r == 31075) data[i] = stringCount; // string currents
+            else data[i] = 2300;                        // 230.0 V / 23.00 A / ...
+        }
+        setLastError(ModbusReadError::None);
+        return true;
+    }
+
+    // True if any recorded request touched a register in [from, to].
+    bool touched(uint16_t from, uint16_t to) const
+    {
+        for (const auto &r : requests)
+        {
+            if (r.reg <= to && r.reg + r.count - 1 >= from) return true;
+        }
+        return false;
+    }
+
+    uint16_t longestRead() const
+    {
+        uint16_t longest = 0;
+        for (const auto &r : requests)
+        {
+            if (r.count > longest) longest = r.count;
+        }
+        return longest;
+    }
+};
+
+static bool hasPoint(const std::vector<TelemetryPoint> &points, const char *name)
+{
+    for (const auto &p : points)
+    {
+        if (p.name == name) return true;
+    }
+    return false;
+}
+
+// Short tiers so the suite does not sit through real 10s/30s periods.
+static void configureTiers(Config &cfg)
+{
+    cfg.setInt("rtu_addr", 3);
+    cfg.setInt("poll_interval_sec", 1);
+    cfg.setInt("poll_medium_interval_sec", 2);
+    cfg.setInt("poll_slow_interval_sec", 4);
+    cfg.setBool("read_storage_regs", true);
+}
+
+// The first cycle after boot publishes everything, whatever its tier.
+void test_tiers_first_cycle_reads_every_block()
+{
+    Config cfg;
+    configureTiers(cfg);
+    ScriptedModbus bus(cfg);
+    SolplanetASW inv(bus, cfg);
+    std::vector<TelemetryPoint> points;
+
+    TEST_ASSERT_TRUE(inv.readBasic(points));
+
+    TEST_ASSERT_TRUE(hasPoint(points, "l1_voltage"));            // fast
+    TEST_ASSERT_TRUE(hasPoint(points, "eps_active_power"));      // fast
+    TEST_ASSERT_TRUE(hasPoint(points, "pv1_power"));             // fast, calculated
+    TEST_ASSERT_TRUE(hasPoint(points, "string1_current"));       // fast
+    TEST_ASSERT_TRUE(hasPoint(points, "device_state_text"));     // medium
+    TEST_ASSERT_TRUE(hasPoint(points, "battery_soc"));           // medium (storage)
+    TEST_ASSERT_TRUE(hasPoint(points, "energy_today"));          // slow
+    TEST_ASSERT_TRUE(hasPoint(points, "grid_export_total"));     // slow
+    TEST_ASSERT_TRUE(hasPoint(points, "battery_cycles"));        // slower (storage)
+    TEST_ASSERT_TRUE(hasPoint(points, "grid_rated_voltage"));    // static
+    TEST_ASSERT_TRUE(hasPoint(points, "grid_code"));             // static
+}
+
+// A steady-state cycle is three transactions: 31319-31379, 31601-31606 and
+// 31634-31674. This is the whole point of the change.
+void test_tiers_fast_cycle_is_three_transactions()
+{
+    Config cfg;
+    configureTiers(cfg);
+    ScriptedModbus bus(cfg);
+    SolplanetASW inv(bus, cfg);
+    std::vector<TelemetryPoint> points;
+
+    TEST_ASSERT_TRUE(inv.readBasic(points));
+    bus.requests.clear();
+    TEST_ASSERT_TRUE(inv.readBasic(points));
+
+    TEST_ASSERT_EQUAL_UINT(3, bus.requests.size());
+    TEST_ASSERT_EQUAL_UINT16(31319, bus.requests[0].reg);
+    TEST_ASSERT_EQUAL_UINT16(61, bus.requests[0].count);
+    TEST_ASSERT_EQUAL_UINT16(31601, bus.requests[1].reg);
+    TEST_ASSERT_EQUAL_UINT16(6, bus.requests[1].count);
+    TEST_ASSERT_EQUAL_UINT16(31634, bus.requests[2].reg);
+    TEST_ASSERT_EQUAL_UINT16(41, bus.requests[2].count);
+
+    TEST_ASSERT_TRUE(hasPoint(points, "l1_voltage"));
+    TEST_ASSERT_TRUE(hasPoint(points, "active_power"));
+    TEST_ASSERT_TRUE(hasPoint(points, "eps_l1_active_power"));
+    TEST_ASSERT_TRUE(hasPoint(points, "grid_l1_power"));
+    TEST_ASSERT_FALSE(hasPoint(points, "battery_soc"));
+    TEST_ASSERT_FALSE(hasPoint(points, "energy_today"));
+    TEST_ASSERT_FALSE(hasPoint(points, "grid_rated_voltage"));
+}
+
+// Without string currents the PV and grid blocks are no longer neighbours.
+void test_tiers_no_strings_splits_the_live_span()
+{
+    Config cfg;
+    configureTiers(cfg);
+    ScriptedModbus bus(cfg);
+    bus.stringCount = 0;
+    SolplanetASW inv(bus, cfg);
+    std::vector<TelemetryPoint> points;
+
+    TEST_ASSERT_TRUE(inv.readBasic(points));
+    bus.requests.clear();
+    TEST_ASSERT_TRUE(inv.readBasic(points));
+
+    TEST_ASSERT_EQUAL_UINT(4, bus.requests.size());
+    TEST_ASSERT_FALSE(bus.touched(31339, 31358));
+    TEST_ASSERT_FALSE(hasPoint(points, "string1_current"));
+}
+
+// Medium-tier blocks come back once their period has passed, and not before.
+void test_tiers_medium_block_returns_after_its_period()
+{
+    Config cfg;
+    configureTiers(cfg);
+    ScriptedModbus bus(cfg);
+    SolplanetASW inv(bus, cfg);
+    std::vector<TelemetryPoint> points;
+
+    TEST_ASSERT_TRUE(inv.readBasic(points));
+    TEST_ASSERT_TRUE(inv.readBasic(points));
+    TEST_ASSERT_FALSE(hasPoint(points, "battery_soc"));
+
+    delay(2100); // medium period is 2s in this suite
+
+    bool sawBattery = false;
+    bool sawStatus = false;
+    bool sawSlow = false;
+    // Slower blocks may be spread over a couple of cycles by the time budget.
+    for (int cycle = 0; cycle < 3; cycle++)
+    {
+        TEST_ASSERT_TRUE(inv.readBasic(points));
+        TEST_ASSERT_TRUE(hasPoint(points, "l1_voltage")); // fast tier is never displaced
+        if (hasPoint(points, "battery_soc")) sawBattery = true;
+        if (hasPoint(points, "device_state")) sawStatus = true;
+        if (hasPoint(points, "energy_today")) sawSlow = true;
+    }
+    TEST_ASSERT_TRUE(sawBattery);
+    TEST_ASSERT_TRUE(sawStatus);
+    TEST_ASSERT_FALSE(sawSlow); // slow period (4s) has not passed yet
+}
+
+// Battery blocks are skipped entirely unless storage reading is enabled.
+void test_tiers_storage_disabled_skips_battery_blocks()
+{
+    Config cfg;
+    configureTiers(cfg);
+    cfg.setBool("read_storage_regs", false);
+    ScriptedModbus bus(cfg);
+    SolplanetASW inv(bus, cfg);
+    std::vector<TelemetryPoint> points;
+
+    TEST_ASSERT_TRUE(inv.readBasic(points));
+
+    TEST_ASSERT_FALSE(bus.touched(31607, 31629));
+    TEST_ASSERT_FALSE(bus.touched(31679, 31687));
+    TEST_ASSERT_FALSE(hasPoint(points, "battery_soc"));
+    TEST_ASSERT_TRUE(hasPoint(points, "l1_voltage"));
+}
+
+// readStorage is a no-op now that readBasic schedules the battery blocks.
+void test_tiers_read_storage_is_empty_success()
+{
+    Config cfg;
+    configureTiers(cfg);
+    ScriptedModbus bus(cfg);
+    SolplanetASW inv(bus, cfg);
+    std::vector<TelemetryPoint> points;
+    points.push_back(TelemetryPoint("stale", "", "1"));
+
+    TEST_ASSERT_TRUE(inv.readStorage(points));
+    TEST_ASSERT_EQUAL_UINT(0, points.size());
+    TEST_ASSERT_EQUAL_UINT(0, bus.requests.size());
+}
+
+// A block the inverter rejects is parked instead of being retried every cycle,
+// and it does not take its neighbours down with it.
+void test_tiers_rejected_block_is_parked_and_neighbours_survive()
+{
+    Config cfg;
+    configureTiers(cfg);
+    ScriptedModbus bus(cfg);
+    bus.rejectFrom = 31634; // no EPS output on this inverter
+    bus.rejectTo = 31662;
+    SolplanetASW inv(bus, cfg);
+    std::vector<TelemetryPoint> points;
+
+    // Cycle 1 discovers it: the poll still succeeds and the rest is published.
+    TEST_ASSERT_TRUE(inv.readBasic(points));
+    TEST_ASSERT_FALSE(hasPoint(points, "eps_active_power"));
+    TEST_ASSERT_TRUE(hasPoint(points, "grid_l1_power"));
+    TEST_ASSERT_TRUE(hasPoint(points, "l1_voltage"));
+
+    // Cycle 2 leaves the rejected registers alone.
+    bus.requests.clear();
+    TEST_ASSERT_TRUE(inv.readBasic(points));
+    TEST_ASSERT_FALSE(bus.touched(31634, 31662));
+    TEST_ASSERT_TRUE(bus.touched(31663, 31674));
+    TEST_ASSERT_TRUE(hasPoint(points, "grid_l1_power"));
+}
+
+// If the device goes quiet the poll fails fast: one timed-out transaction, not
+// one per block.
+void test_tiers_silent_device_fails_poll_without_reading_every_block()
+{
+    Config cfg;
+    configureTiers(cfg);
+    ScriptedModbus bus(cfg);
+    SolplanetASW inv(bus, cfg);
+    std::vector<TelemetryPoint> points;
+
+    TEST_ASSERT_TRUE(inv.readBasic(points));
+
+    bus.silent = true;
+    bus.requests.clear();
+    TEST_ASSERT_FALSE(inv.readBasic(points));
+    TEST_ASSERT_EQUAL_UINT(1, bus.requests.size());
+    TEST_ASSERT_EQUAL_UINT(0, points.size());
+
+    // And it recovers by itself once the device answers again.
+    bus.silent = false;
+    TEST_ASSERT_TRUE(inv.readBasic(points));
+    TEST_ASSERT_TRUE(hasPoint(points, "l1_voltage"));
+}
+
+// An inverter that accepts the parts but refuses them merged still delivers
+// data on that cycle, and merging is switched off afterwards.
+void test_tiers_merged_read_rejected_falls_back_to_single_blocks()
+{
+    Config cfg;
+    configureTiers(cfg);
+    ScriptedModbus bus(cfg);
+    bus.rejectMerged = true;
+    SolplanetASW inv(bus, cfg);
+    std::vector<TelemetryPoint> points;
+
+    TEST_ASSERT_TRUE(inv.readBasic(points));
+    TEST_ASSERT_TRUE(hasPoint(points, "l1_voltage"));
+    TEST_ASSERT_TRUE(hasPoint(points, "pv1_voltage"));
+    TEST_ASSERT_TRUE(hasPoint(points, "eps_active_power"));
+
+    bus.requests.clear();
+    TEST_ASSERT_TRUE(inv.readBasic(points));
+    TEST_ASSERT_TRUE(bus.longestRead() <= 32);
+    TEST_ASSERT_TRUE(hasPoint(points, "l1_voltage"));
+}
+
+// On a noisy bus long frames are the ones that get hit. If they keep failing
+// while short reads work, the driver shortens its reads by itself.
+void test_tiers_long_frames_failing_shrinks_read_size()
+{
+    Config cfg;
+    configureTiers(cfg);
+    ScriptedModbus bus(cfg);
+    bus.corruptAbove = 32;
+    SolplanetASW inv(bus, cfg);
+    std::vector<TelemetryPoint> points;
+
+    // Data keeps flowing while it adapts.
+    for (int cycle = 0; cycle < 4; cycle++)
+    {
+        TEST_ASSERT_TRUE(inv.readBasic(points));
+        TEST_ASSERT_TRUE(hasPoint(points, "l1_voltage"));
+        TEST_ASSERT_TRUE(hasPoint(points, "eps_active_power"));
+    }
+
+    bus.requests.clear();
+    TEST_ASSERT_TRUE(inv.readBasic(points));
+    TEST_ASSERT_TRUE(bus.longestRead() <= 32);
+    TEST_ASSERT_TRUE(hasPoint(points, "l1_voltage"));
+}
+
 void setup()
 {
     delay(2000); // Wait for serial monitor
@@ -258,6 +600,17 @@ void setup()
     RUN_TEST(test_multiple_telemetry_readings);
     RUN_TEST(test_configuration_parameters);
     RUN_TEST(test_data_validation);
+
+    RUN_TEST(test_tiers_first_cycle_reads_every_block);
+    RUN_TEST(test_tiers_fast_cycle_is_three_transactions);
+    RUN_TEST(test_tiers_no_strings_splits_the_live_span);
+    RUN_TEST(test_tiers_medium_block_returns_after_its_period);
+    RUN_TEST(test_tiers_storage_disabled_skips_battery_blocks);
+    RUN_TEST(test_tiers_read_storage_is_empty_success);
+    RUN_TEST(test_tiers_rejected_block_is_parked_and_neighbours_survive);
+    RUN_TEST(test_tiers_silent_device_fails_poll_without_reading_every_block);
+    RUN_TEST(test_tiers_merged_read_rejected_falls_back_to_single_blocks);
+    RUN_TEST(test_tiers_long_frames_failing_shrinks_read_size);
 
     UNITY_END();
 }

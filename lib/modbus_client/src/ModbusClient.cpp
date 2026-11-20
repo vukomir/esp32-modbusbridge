@@ -1,9 +1,11 @@
 #include "ModbusClient.h"
+#include "ModbusFrame.h"
 #include <ESPLogger.h>
 
 ModbusClient::ModbusClient(Config &config)
     : config(config), serial(&Serial2), dePin(-1), ledPin(2), initialized(false),
-      baudrate(9600), parity(SERIAL_8N1), stopBits(1), dataBits(8), responseTimeout(2000)
+      baudrate(9600), parity('N'), stopBits(1), dataBits(8),
+      lastError(ModbusReadError::None), lastExceptionCode(0)
 {
 }
 
@@ -28,13 +30,9 @@ bool ModbusClient::begin()
     dataBits = getDataBitsValue();
     dePin = config.getInt("rs485_de_re_pin", 4);
 
-    // Calculate adaptive response timeout based on baud rate
-    // Formula: Base timeout + transmission time for max response (256 bytes) + safety margin
-    uint32_t bitsPerByte = 1 + dataBits + (parity != 'N' ? 1 : 0) + stopBits;
-    uint32_t maxResponseTime = (256 * bitsPerByte * 1000) / baudrate; // Max response transmission time
-    responseTimeout = maxResponseTime + 500;                          // Add 500ms safety margin
-
-    ESPLogger::debug("Calculated response timeout: %lums (based on %lu baud)", responseTimeout, baudrate);
+    // The response timeout is no longer a single number sized for the largest
+    // possible reply (256 bytes = 766ms at 9600 baud). receiveFrame() derives it
+    // per request from the reply length it expects - see RESPONSE_TURNAROUND_MS.
 
     // Configure DE/RE pin
     if (dePin >= 0)
@@ -110,7 +108,9 @@ bool ModbusClient::testConnection()
         return false;
     }
 
-    ESPLogger::info("Testing Modbus connection - hardware check passed");
+    // debug, not info: Poller calls this on every cycle, which at a 1s poll
+    // interval would be one routine line per second.
+    ESPLogger::debug("Testing Modbus connection - hardware check passed");
 
     // For now, just return true if MAX485 is detected
     // Actual device communication will be tested during normal polling
@@ -169,6 +169,7 @@ bool ModbusClient::readWithRetry(uint8_t slaveId, uint8_t function, uint16_t sta
 {
     if (!initialized || count == 0 || count > 125)
     {
+        setLastError(ModbusReadError::InvalidRequest);
         return false;
     }
 
@@ -176,25 +177,49 @@ bool ModbusClient::readWithRetry(uint8_t slaveId, uint8_t function, uint16_t sta
     if (maxAttempts < 1) maxAttempts = 1;
     if (maxAttempts > 10) maxAttempts = 10;
 
-    uint32_t backoff = INITIAL_BACKOFF_MS;
+    uint32_t retryDelay = RETRY_DELAY_MS;
+    ModbusReadError error = ModbusReadError::None;
+    uint8_t exceptionCode = 0;
+
     for (uint8_t attempt = 1; attempt <= maxAttempts; ++attempt)
     {
-        if (readOnce(slaveId, function, startAddr, count, data))
+        error = readOnce(slaveId, function, startAddr, count, data, exceptionCode);
+        if (error == ModbusReadError::None)
         {
             if (attempt > 1)
             {
                 ESPLogger::info("Modbus read recovered on attempt %u/%u (slave=%u, addr=0x%04X)",
                                 attempt, maxAttempts, slaveId, startAddr);
             }
+            setLastError(ModbusReadError::None);
             return true;
+        }
+
+        // The device answered and refused. Asking again gets the same answer,
+        // so do not burn two more transactions on it. parseReadResponse has
+        // already logged the exception code.
+        if (error == ModbusReadError::Exception)
+        {
+            setLastError(error, exceptionCode);
+            return false;
         }
 
         if (attempt < maxAttempts)
         {
-            ESPLogger::warn("Modbus read attempt %u/%u failed (slave=%u, addr=0x%04X); retrying in %lums",
-                            attempt, maxAttempts, slaveId, startAddr, backoff);
-            delay(backoff);
-            backoff *= 2; // 100, 200, 400ms ...
+            if (error == ModbusReadError::BadFrame)
+            {
+                // Something is (or just was) on the wire. Let it finish.
+                ESPLogger::warn("Modbus read attempt %u/%u failed (slave=%u, addr=0x%04X); retrying in %lums",
+                                attempt, maxAttempts, slaveId, startAddr, (unsigned long)retryDelay);
+                delay(retryDelay);
+                retryDelay *= 2; // 20, 40ms ...
+            }
+            else
+            {
+                // Timeout: the bus has been silent for the whole wait already.
+                ESPLogger::warn("Modbus read attempt %u/%u timed out (slave=%u, addr=0x%04X); retrying",
+                                attempt, maxAttempts, slaveId, startAddr);
+            }
         }
     }
 
@@ -204,10 +229,12 @@ bool ModbusClient::readWithRetry(uint8_t slaveId, uint8_t function, uint16_t sta
         ESPLogger::error("Modbus read failed after %u attempts (slave=%u, addr=0x%04X, count=%u, fc=0x%02X)",
                          maxAttempts, slaveId, startAddr, count, function);
     }
+    setLastError(error);
     return false;
 }
 
-bool ModbusClient::readOnce(uint8_t slaveId, uint8_t function, uint16_t startAddr, uint16_t count, uint16_t *data)
+ModbusReadError ModbusClient::readOnce(uint8_t slaveId, uint8_t function, uint16_t startAddr, uint16_t count,
+                                       uint16_t *data, uint8_t &exceptionOut)
 {
     // Turn on LED to indicate Modbus activity
     ledOn();
@@ -216,8 +243,8 @@ bool ModbusClient::readOnce(uint8_t slaveId, uint8_t function, uint16_t startAdd
     size_t frameLength = buildReadFrame(slaveId, function, startAddr, count, frame);
 
     uint32_t txTime = millis();
-    bool success = false;
-    uint8_t exceptionCode = 0;
+    ModbusReadError result = ModbusReadError::InvalidRequest;
+    exceptionOut = 0;
 
     if (frameLength > 0 && sendFrame(frame, frameLength))
     {
@@ -236,57 +263,56 @@ bool ModbusClient::readOnce(uint8_t slaveId, uint8_t function, uint16_t startAdd
         logFrame(txLog);
 
         uint8_t response[256];
-        size_t responseLength;
-        uint32_t rxTime = millis();
+        size_t rxLength = 0;
 
-        if (receiveFrame(response, sizeof(response), responseLength))
+        result = receiveFrame(response, sizeof(response), rxLength,
+                              slaveId, function, ModbusClient::responseLength(count));
+
+        if (result == ModbusReadError::None)
         {
-            uint32_t responseTime = rxTime - txTime;
-            success = parseReadResponse(response, responseLength, count, data);
-
             // Check for Modbus exception (response[1] has high bit set)
-            if (responseLength >= 3 && (response[1] & 0x80))
+            if (response[1] & 0x80)
             {
-                exceptionCode = response[2];
-                success = false;
+                exceptionOut = response[2];
+                result = ModbusReadError::Exception;
+                ESPLogger::error("Modbus exception from slave %d: %d (addr=0x%04X, count=%u)",
+                                 slaveId, exceptionOut, startAddr, count);
             }
+            else if (!parseReadResponse(response, rxLength, count, data))
+            {
+                result = ModbusReadError::BadFrame;
+            }
+        }
 
-            // Log RX frame
-            ModbusFrameLog rxLog;
-            rxLog.timestamp = rxTime;
-            rxLog.isTx = false;
-            rxLog.slaveId = slaveId;
-            rxLog.functionCode = function;
-            rxLog.startAddr = startAddr;
-            rxLog.count = count;
-            rxLog.success = success;
-            rxLog.exceptionCode = exceptionCode;
-            rxLog.hexDump = bytesToHex(response, responseLength);
-            rxLog.responseTimeMs = responseTime;
-            logFrame(rxLog);
-        }
-        else
-        {
-            // Timeout - log failed RX
-            ModbusFrameLog rxLog;
-            rxLog.timestamp = millis();
-            rxLog.isTx = false;
-            rxLog.slaveId = slaveId;
-            rxLog.functionCode = function;
-            rxLog.startAddr = startAddr;
-            rxLog.count = count;
-            rxLog.success = false;
-            rxLog.exceptionCode = 0;
-            rxLog.hexDump = "TIMEOUT";
-            rxLog.responseTimeMs = millis() - txTime;
-            logFrame(rxLog);
-        }
+        // Log RX frame. Whatever arrived is recorded, including frames that
+        // failed CRC - those bytes are the evidence when chasing bus noise.
+        ModbusFrameLog rxLog;
+        rxLog.timestamp = millis();
+        rxLog.isTx = false;
+        rxLog.slaveId = slaveId;
+        rxLog.functionCode = function;
+        rxLog.startAddr = startAddr;
+        rxLog.count = count;
+        rxLog.success = (result == ModbusReadError::None);
+        rxLog.exceptionCode = exceptionOut;
+        rxLog.hexDump = (rxLength > 0) ? bytesToHex(response, rxLength) : String("TIMEOUT");
+        // Request sent -> reply complete. This used to be sampled before the
+        // receive started, so it only ever measured the transmit time.
+        rxLog.responseTimeMs = rxLog.timestamp - txTime;
+        logFrame(rxLog);
     }
 
     // Turn off LED after operation completes
     ledOff();
 
-    return success;
+    return result;
+}
+
+uint32_t ModbusClient::frameTimeMs(size_t bytes) const
+{
+    uint32_t bitsPerByte = 1 + dataBits + (parity != 'N' ? 1 : 0) + stopBits;
+    uint32_t baud = baudrate ? baudrate : 9600;
+    return (uint32_t)((bytes * bitsPerByte * 1000u + baud - 1) / baud);
 }
 
 uint32_t ModbusClient::combineRegisters(uint16_t high, uint16_t low) const
@@ -384,118 +410,116 @@ bool ModbusClient::sendFrame(const uint8_t *frame, size_t length)
     return written == length;
 }
 
-bool ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, size_t &actualLength)
+ModbusReadError ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, size_t &actualLength,
+                                           uint8_t slaveId, uint8_t function, size_t expectedLength)
 {
+    actualLength = 0;
     if (!initialized)
     {
-        return false;
+        return ModbusReadError::InvalidRequest;
+    }
+    if (expectedLength > maxLength)
+    {
+        expectedLength = maxLength;
     }
 
-    actualLength = 0;
-    unsigned long startTime = millis();
+    // The frame ends when the expected number of bytes is in (see
+    // ModbusFrame::Assembler), not after a stretch of silence.
+    //
+    // The old loop waited for 10ms of quiet after the last byte and took one
+    // byte per 1ms tick. Both cost time on every single transaction, and the
+    // second would have capped throughput at ~1 byte/ms whatever the baud rate.
+    ModbusFrame::Assembler frame(buffer, maxLength, slaveId, function, expectedLength);
+
+    const unsigned long startTime = millis();
+    const unsigned long deadline = RESPONSE_TURNAROUND_MS + frameTimeMs(expectedLength) + 20;
     unsigned long lastByteTime = startTime;
 
-    while (millis() - startTime < responseTimeout)
+    while (!frame.complete())
     {
-        if (serial->available())
+        while (!frame.complete() && serial->available() > 0)
         {
-            if (actualLength >= maxLength)
+            int c = serial->read();
+            if (c < 0)
             {
-                ESPLogger::error("Response buffer overflow");
-                return false;
+                break;
             }
-
-            uint8_t byte = serial->read();
-            buffer[actualLength++] = byte;
             lastByteTime = millis();
-
-            // Debug: Log each byte received
-            ESPLogger::debug("RX byte #%d: 0x%02X (%d) at +%lums",
-                           actualLength, byte, byte, millis() - startTime);
+            frame.push((uint8_t)c);
         }
-        else if (actualLength > 0 && millis() - lastByteTime > 10) // Inter-frame gap per Modbus spec (~1.5 char = ~1.6ms at 9600, 10ms is safe margin)
+
+        if (frame.complete())
         {
-            // Inter-frame timeout - frame complete
-            ESPLogger::debug("Inter-frame timeout reached (10ms), frame complete");
             break;
+        }
+
+        unsigned long now = millis();
+        if (now - startTime > deadline)
+        {
+            break;
+        }
+        if (frame.length() > 0)
+        {
+            // Mid-frame silence means the reply was cut short. The UART driver
+            // hands bytes over in chunks (when its FIFO threshold is reached or
+            // the line goes idle), so up to a chunk's worth of wire time can
+            // pass with nothing new visible here even though the device is
+            // still sending. Allow for that before giving up.
+            size_t pending = frame.remaining();
+            if (pending > 128)
+            {
+                pending = 128;
+            }
+            if (now - lastByteTime > frameTimeMs(pending) + 15)
+            {
+                break;
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(1)); // Allow other tasks to run (FreeRTOS-aware)
     }
 
-    unsigned long totalTime = millis() - startTime;
-    ESPLogger::debug("Response received: %zu bytes in %lums", actualLength, totalTime);
+    actualLength = frame.length();
+    const size_t discarded = frame.discarded();
 
-    // Log response summary (reduced verbosity)
-    if (actualLength > 0)
+    if (discarded > 0)
     {
-        ESPLogger::debug("Response frame received (%zu bytes)", actualLength);
+        ESPLogger::debug("Discarded %u stray byte(s) ahead of the Modbus reply", (unsigned)discarded);
     }
 
-    if (actualLength < 5)
-    { // Minimum frame: slave + function + data + 2 CRC bytes
-        ESPLogger::error("Response too short: %zu bytes (minimum 5 required)", actualLength);
-        if (actualLength == 0)
+    if (!frame.complete())
+    {
+        if (actualLength == 0 && discarded == 0)
         {
             ESPLogger::error("No response received - check device address, baud rate, and wiring");
+            return ModbusReadError::Timeout;
         }
-        else if (actualLength == 2)
-        {
-            ESPLogger::error("Received 2 bytes (0x%02X 0x%02X) - likely electrical noise or baud rate mismatch",
-                             buffer[0], buffer[1]);
-            ESPLogger::error("Try: 1) Swap A/B wiring, 2) Add termination resistor, 3) Try different baud rate");
-        }
-        else
-        {
-            ESPLogger::error("Partial response (%zu bytes) - possible timing or electrical issues", actualLength);
-        }
-        return false;
+        ESPLogger::error("Incomplete response: got %u of %u bytes (%u stray byte(s) discarded)",
+                         (unsigned)actualLength, (unsigned)expectedLength, (unsigned)discarded);
+        return ModbusReadError::BadFrame;
     }
 
     if (!validateCRC(buffer, actualLength))
     {
-        ESPLogger::error("CRC validation failed");
-        return false;
+        // Lengths included on purpose: a right-length frame with a bad CRC is
+        // corruption on the wire, which no amount of firmware will fix.
+        ESPLogger::error("CRC validation failed (%u bytes received, %u expected)",
+                         (unsigned)actualLength, (unsigned)expectedLength);
+        return ModbusReadError::BadFrame;
     }
 
-    ESPLogger::debug("Frame received and validated successfully");
-    return true;
+    ESPLogger::debug("Frame received and validated successfully (%u bytes)", (unsigned)actualLength);
+    return ModbusReadError::None;
 }
 
 uint16_t ModbusClient::calculateCRC(const uint8_t *data, size_t length) const
 {
-    uint16_t crc = 0xFFFF;
-
-    for (size_t i = 0; i < length; i++)
-    {
-        crc ^= data[i];
-        for (int j = 0; j < 8; j++)
-        {
-            if (crc & 0x0001)
-            {
-                crc = (crc >> 1) ^ 0xA001;
-            }
-            else
-            {
-                crc >>= 1;
-            }
-        }
-    }
-
-    return crc;
+    return ModbusFrame::crc16(data, length);
 }
 
 bool ModbusClient::validateCRC(const uint8_t *frame, size_t length) const
 {
-    if (length < 3)
-    {
-        return false;
-    }
-
-    uint16_t receivedCRC = frame[length - 2] | (frame[length - 1] << 8);
-    uint16_t calculatedCRC = calculateCRC(frame, length - 2);
-
-    return receivedCRC == calculatedCRC;
+    return ModbusFrame::crcValid(frame, length);
 }
 
 void ModbusClient::setTransmitMode()
@@ -550,14 +574,12 @@ bool ModbusClient::parseReadResponse(const uint8_t *response, size_t length, uin
         return false;
     }
 
-    uint8_t slaveId = response[0];
     uint8_t function = response[1];
 
-    // Check for exception response
+    // Exception replies are detected and logged by readOnce() before it gets
+    // here; this is only a guard against being handed one directly.
     if (function & 0x80)
     {
-        uint8_t exceptionCode = response[2];
-        ESPLogger::error("Modbus exception from slave %d: %d", slaveId, exceptionCode);
         return false;
     }
 

@@ -68,6 +68,7 @@ class TestRunner:
             "test_config", 
             "test_esplogger",
             "test_modbus_client",
+            "test_modbus_frame",
             "test_inverter_factory",
             "test_solplanet_asw",
             "test_hiking_dds238",

@@ -1,7 +1,7 @@
 {
   "device_id": "example_hybrid_v1",
   "name": "Example Hybrid Inverter",
-  "description": "Template combining flat single-register reads, block (group) reads, bitfield decoding, and NaN sentinels. Adjust register addresses, types, and scaling based on your device's Modbus documentation.",
+  "description": "Template combining flat single-register reads, block (group) reads, per-entry polling intervals, bitfield decoding, and NaN sentinels. Adjust register addresses, types, and scaling based on your device's Modbus documentation.",
   "schema_version": 2,
   "registers": [
     {
@@ -11,7 +11,8 @@
       "type": "uint16",
       "scale": 1.0,
       "unit": "",
-      "comment": "Standalone status register, polled with its own Modbus transaction"
+      "interval_sec": 10,
+      "comment": "Standalone status register, polled with its own Modbus transaction. interval_sec: read every 10s instead of every poll cycle."
     }
   ],
   "groups": [
@@ -37,6 +38,7 @@
       "start": "0x0100",
       "count": 6,
       "storage": true,
+      "interval_sec": 10,
       "fields": [
         { "offset": 0, "name": "battery_voltage", "type": "uint16", "scale": 0.01, "unit": "V" },
         { "offset": 1, "name": "battery_current", "type": "int16",  "scale": 0.1,  "unit": "A",  "comment": "positive=charging, negative=discharging" },

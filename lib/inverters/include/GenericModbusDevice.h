@@ -16,6 +16,9 @@
  * Schema versions:
  *   missing or 1 - flat registers[] only (legacy).
  *   2            - adds groups[], per-field bits[], per-field nan_value.
+ *
+ * "interval_sec" on a register or group is accepted at any schema version: it
+ * is optional and older firmware simply ignores it.
  */
 class GenericModbusDevice : public InverterInterface
 {
@@ -79,6 +82,35 @@ private:
         std::vector<BitField> bits;  // empty = publish numeric value; non-empty = publish bits, suppress numeric
     };
 
+    // Optional per-entry polling interval ("interval_sec" in the JSON). Lets a
+    // device file read live values on every cycle and slow-moving ones (energy
+    // counters, temperatures, constants) less often, which is what keeps a
+    // short poll interval affordable.
+    struct PollSchedule
+    {
+        uint32_t intervalMs = 0; // 0 = every poll cycle
+        uint32_t nextDueMs = 0;
+        bool scheduled = false;  // nextDueMs is valid (false until first successful read)
+
+        bool due(uint32_t now) const
+        {
+            // Signed difference so the comparison survives millis() wrapping.
+            return intervalMs == 0 || !scheduled || (int32_t)(now - nextDueMs) >= 0;
+        }
+        void markRead(uint32_t now)
+        {
+            // Due slightly early rather than a whole cycle late: poll cycles
+            // are not perfectly periodic.
+            uint32_t tolerance = intervalMs / 10;
+            if (tolerance > 200) tolerance = 200;
+            nextDueMs = now + intervalMs - tolerance;
+            scheduled = true;
+        }
+    };
+
+    // Longest accepted interval_sec (24h).
+    static constexpr uint32_t MAX_INTERVAL_SEC = 86400;
+
     // Legacy flat register entry (one Modbus transaction per entry).
     struct RegisterDef
     {
@@ -86,6 +118,7 @@ private:
         uint8_t fc;
         bool isStorage;
         Field field;
+        PollSchedule schedule;
     };
 
     // Block-read group: one Modbus transaction reads `count` words starting at `startAddr`,
@@ -98,6 +131,7 @@ private:
         uint8_t fc;
         bool isStorage;
         std::vector<Field> fields;
+        PollSchedule schedule;
     };
 
     int schemaVersion;
@@ -119,6 +153,8 @@ private:
     static bool parseBits(JsonArrayConst arr, std::vector<BitField> &out, String &errorOut);
     static bool parseRegisterDef(JsonObjectConst obj, int schemaVer, RegisterDef &out, String &errorOut);
     static bool parseGroup(JsonObjectConst obj, int schemaVer, RegisterGroup &out, String &errorOut);
+    // Reads the optional "interval_sec" key of a register or group named `what`.
+    static bool parseInterval(JsonObjectConst obj, const String &what, PollSchedule &out, String &errorOut);
     static bool checkDuplicateNames(const std::vector<RegisterDef> &regs,
                                     const std::vector<RegisterGroup> &grps,
                                     String &errorOut);

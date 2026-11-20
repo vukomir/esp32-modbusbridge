@@ -10,7 +10,8 @@ test/
 ├── test_basic/            Framework smoke tests
 ├── test_config/           Config — LittleFS-backed settings
 ├── test_esplogger/        Logging library
-├── test_modbus_client/    Modbus RTU framing, CRC, retries
+├── test_modbus_client/    Modbus RTU client configuration and helpers
+├── test_modbus_frame/     Modbus RTU framing rules (CRC, frame length, re-alignment) — hardware-free
 ├── test_inverter_factory/ InverterFactory model dispatch
 ├── test_solplanet_asw/    SolPlanet ASW register parsing
 ├── test_hiking_dds238/    Hiking DDS238 meter

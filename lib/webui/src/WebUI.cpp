@@ -223,7 +223,8 @@ void WebUI::handleSave()
         }
         else if (name == "mqtt_port" || name == "rtu_addr" ||
                  name == "baudrate" || name == "data_bits" || name == "stop_bits" ||
-                 name == "rs485_de_re_pin" || name == "poll_interval_sec")
+                 name == "rs485_de_re_pin" || name == "poll_interval_sec" ||
+                 name == "poll_medium_interval_sec" || name == "poll_slow_interval_sec")
         {
             config.setInt(name, value.toInt());
         }
@@ -931,7 +932,12 @@ String WebUI::generateConfigForm()
                         generateDeviceOptions(config.getString("device_model")),
                         "Device Model");
     html += checkboxInput("read_storage_regs", config.getBool("read_storage_regs"), "Read Battery/Storage Registers");
-    html += textInput("poll_interval_sec", String(config.getInt("poll_interval_sec")), "Poll Interval (seconds)", "number");
+    html += textInput("poll_interval_sec", String(config.getInt("poll_interval_sec")), "Poll Interval (seconds) - live values", "number");
+    // Tiered drivers (SolPlanet ASW) read status and battery at the medium
+    // interval and energy counters at the slow one. Defaults are passed
+    // explicitly because configs saved by older firmware lack these keys.
+    html += textInput("poll_medium_interval_sec", String(config.getInt("poll_medium_interval_sec", 10)), "Medium Interval (seconds) - status, temperatures, battery", "number");
+    html += textInput("poll_slow_interval_sec", String(config.getInt("poll_slow_interval_sec", 30)), "Slow Interval (seconds) - energy counters", "number");
     html += "</fieldset>";
 
     // System Configuration
