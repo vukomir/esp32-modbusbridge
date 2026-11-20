@@ -223,7 +223,10 @@ void pollerTask(void *parameter)
 
     for (;;)
     {
-        if (poller.isInitialized())
+        // Stand down while firmware is being uploaded: flash writes stall every
+        // task, and a poll plus its MQTT burst every second competes with the
+        // upload for the WiFi link.
+        if (poller.isInitialized() && !WebUI::isOtaInProgress())
         {
             poller.poll();
         }
