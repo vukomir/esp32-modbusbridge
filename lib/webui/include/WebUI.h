@@ -30,10 +30,6 @@ public:
     void stop();
     bool isRunning() const;
 
-    // True while a firmware upload is being received. The poller task checks
-    // this and skips its cycle so the upload has the device to itself.
-    static bool isOtaInProgress();
-
 private:
     Config &config;
     WiFiManager &wifiManager;
@@ -145,10 +141,4 @@ private:
     String generateConsoleJS();
 
     static WebUI *instance; // For static callback
-
-    // Firmware upload state (see the /update handler).
-    static constexpr unsigned long OTA_STALL_TIMEOUT_MS = 15000;
-    static volatile bool otaInProgress;
-    static volatile unsigned long otaLastActivityMs;
-    static bool otaWriteFailed; // first write error already logged
 };

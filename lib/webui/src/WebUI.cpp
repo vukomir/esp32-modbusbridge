@@ -10,9 +10,6 @@
 // Static log buffer initialization
 WebUI::LogEntry WebUI::logBuffer[LOG_BUFFER_SIZE];
 int WebUI::logBufferIndex = 0;
-volatile bool WebUI::otaInProgress = false;
-volatile unsigned long WebUI::otaLastActivityMs = 0;
-bool WebUI::otaWriteFailed = false;
 int WebUI::logBufferCount = 0;
 unsigned long WebUI::logStartTime = 0;
 WebUI *WebUI::instance = nullptr;
@@ -104,54 +101,20 @@ bool WebUI::begin(uint16_t port)
               { 
                   HTTPUpload& upload = server.upload();
                   if (upload.status == UPLOAD_FILE_START) {
-                      // An earlier upload that was cut off mid-way leaves the
-                      // updater "running" with part of the old image counted.
-                      // begin() then refuses to start, and the chunks of this
-                      // upload are appended to the stale session until they
-                      // run past its size (error 4, "not enough space") - the
-                      // device could not be updated again without a reboot.
-                      if (Update.isRunning()) {
-                          ESPLogger::warn("OTA: discarding an unfinished earlier upload");
-                          Update.abort();
-                      }
-                      otaWriteFailed = false;
-                      // Pause Modbus polling for the duration: flash writes
-                      // stall every task, and the upload should not compete
-                      // with a poll and ~60 MQTT publishes every second.
-                      otaInProgress = true;
-                      otaLastActivityMs = millis();
                       uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
-                      ESPLogger::info("OTA Update started: %s (space for %u bytes)",
-                                      upload.filename.c_str(), (unsigned)maxSketchSpace);
                       if (!Update.begin(maxSketchSpace)) {
                           ESPLogger::error("OTA Update begin failed: error %d", Update.getError());
                       }
                   } else if (upload.status == UPLOAD_FILE_WRITE) {
-                      otaLastActivityMs = millis();
                       if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-                          // Once, not per chunk: a failed upload used to write
-                          // hundreds of identical lines and push everything
-                          // else out of the retained log.
-                          if (!otaWriteFailed) {
-                              otaWriteFailed = true;
-                              ESPLogger::error("OTA Update write failed at %u bytes: error %d (further chunks ignored)",
-                                               (unsigned)upload.totalSize, Update.getError());
-                          }
+                          ESPLogger::error("OTA Update write failed: error %d", Update.getError());
                       }
                   } else if (upload.status == UPLOAD_FILE_END) {
                       if (Update.end(true)) {
                           ESPLogger::info("OTA Update Success: %zu bytes", upload.totalSize);
                       } else {
-                          ESPLogger::error("OTA Update end failed after %u bytes: error %d",
-                                           (unsigned)upload.totalSize, Update.getError());
-                          // Leave nothing half-open for the next attempt.
-                          Update.abort();
+                          ESPLogger::error("OTA Update end failed: error %d", Update.getError());
                       }
-                      otaInProgress = false;
-                  } else if (upload.status == UPLOAD_FILE_ABORTED) {
-                      ESPLogger::warn("OTA Update aborted by the client after %u bytes", (unsigned)upload.totalSize);
-                      Update.abort();
-                      otaInProgress = false;
                   } });
     // Add captive portal detection routes
     server.on("/generate_204", HTTP_GET, [this]()
@@ -210,14 +173,6 @@ void WebUI::stop()
         running = false;
         ESPLogger::info("Web UI stopped");
     }
-}
-
-bool WebUI::isOtaInProgress()
-{
-    // The activity timeout covers an upload that simply stops arriving (WiFi
-    // drop, closed browser tab) without the server ever reporting an abort.
-    // Without it polling would stay paused until the next reboot.
-    return otaInProgress && (millis() - otaLastActivityMs) < OTA_STALL_TIMEOUT_MS;
 }
 
 bool WebUI::isRunning() const
