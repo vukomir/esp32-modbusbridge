@@ -58,6 +58,41 @@ constexpr size_t readResponseLength(uint16_t count)
 constexpr size_t EXCEPTION_LENGTH = 5;
 
 /**
+ * Rebuilds a normal read reply whose first one or two bytes never arrived.
+ *
+ * Seen in the field: the reply comes in complete except for the slave address
+ * (occasionally the function code as well), because the RS485 transceiver was
+ * still switching back to receive when the device began to answer. Those bytes
+ * are known - they are what we asked for - so they can be put back, and the
+ * CRC then says whether the result really is the frame the device sent. A
+ * wrong guess fails the CRC exactly as line noise would.
+ *
+ * `raw` holds everything received, unaligned. On success the complete frame is
+ * written to `out` (which must hold expectedLength bytes) and its length is
+ * returned; otherwise 0. Exception replies are deliberately not reconstructed:
+ * three or four bytes are too little evidence to conclude the device refused.
+ */
+inline size_t recoverMissingHeader(const uint8_t *raw, size_t rawLength, uint8_t slaveId, uint8_t function,
+                                   size_t expectedLength, uint8_t *out)
+{
+    const uint8_t header[2] = {slaveId, function};
+    for (size_t missing = 1; missing <= 2; missing++)
+    {
+        if (expectedLength <= missing + 2 || rawLength + missing != expectedLength)
+        {
+            continue;
+        }
+        memcpy(out, header, missing);
+        memcpy(out + missing, raw, rawLength);
+        if (crcValid(out, expectedLength))
+        {
+            return expectedLength;
+        }
+    }
+    return 0;
+}
+
+/**
  * Collects the reply to one read request, byte by byte.
  *
  * The reply to a read is fully determined by the request: it is either

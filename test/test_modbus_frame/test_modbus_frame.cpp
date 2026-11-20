@@ -203,6 +203,68 @@ void test_never_writes_past_buffer()
     TEST_ASSERT_TRUE(frame.complete());
 }
 
+
+// ---- Replies that lost their first byte(s) in the TX->RX turnaround --------
+
+void test_recovers_reply_missing_slave_byte()
+{
+    std::vector<uint8_t> reply = makeReply(3, 0x04, {0x1234, 0x5678, 0x9ABC, 0xDEF0, 0x0001, 0x0002});
+    std::vector<uint8_t> raw(reply.begin() + 1, reply.end()); // 16 of 17 bytes, as seen in the field
+    uint8_t out[256];
+
+    size_t n = ModbusFrame::recoverMissingHeader(raw.data(), raw.size(), 3, 0x04, reply.size(), out);
+
+    TEST_ASSERT_EQUAL_UINT(reply.size(), n);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(reply.data(), out, reply.size());
+}
+
+void test_recovers_reply_missing_slave_and_function_bytes()
+{
+    std::vector<uint8_t> reply = makeReply(3, 0x04, {0x1234, 0x5678, 0x9ABC, 0xDEF0, 0x0001, 0x0002});
+    std::vector<uint8_t> raw(reply.begin() + 2, reply.end()); // 15 of 17 bytes
+    uint8_t out[256];
+
+    size_t n = ModbusFrame::recoverMissingHeader(raw.data(), raw.size(), 3, 0x04, reply.size(), out);
+
+    TEST_ASSERT_EQUAL_UINT(reply.size(), n);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(reply.data(), out, reply.size());
+}
+
+// Putting the header back must not paper over real corruption.
+void test_recovery_rejects_corrupted_payload()
+{
+    std::vector<uint8_t> reply = makeReply(3, 0x04, {0x1234, 0x5678});
+    std::vector<uint8_t> raw(reply.begin() + 1, reply.end());
+    raw[3] ^= 0x10;
+    uint8_t out[256];
+
+    TEST_ASSERT_EQUAL_UINT(0, ModbusFrame::recoverMissingHeader(raw.data(), raw.size(), 3, 0x04, reply.size(), out));
+}
+
+// A reply from another slave with its first byte missing is not ours either.
+void test_recovery_rejects_other_slaves_reply()
+{
+    std::vector<uint8_t> reply = makeReply(7, 0x04, {0x1234, 0x5678});
+    std::vector<uint8_t> raw(reply.begin() + 1, reply.end());
+    uint8_t out[256];
+
+    TEST_ASSERT_EQUAL_UINT(0, ModbusFrame::recoverMissingHeader(raw.data(), raw.size(), 3, 0x04, reply.size(), out));
+}
+
+// Only "exactly one or two bytes short" qualifies; anything else is not this fault.
+void test_recovery_requires_matching_length()
+{
+    std::vector<uint8_t> reply = makeReply(3, 0x04, {0x1234, 0x5678});
+    uint8_t out[256];
+
+    // Complete frame: nothing is missing.
+    TEST_ASSERT_EQUAL_UINT(0, ModbusFrame::recoverMissingHeader(reply.data(), reply.size(), 3, 0x04, reply.size(), out));
+    // Three bytes short.
+    TEST_ASSERT_EQUAL_UINT(0, ModbusFrame::recoverMissingHeader(reply.data() + 3, reply.size() - 3, 3, 0x04, reply.size(), out));
+    // Nothing received.
+    TEST_ASSERT_EQUAL_UINT(0, ModbusFrame::recoverMissingHeader(reply.data(), 0, 3, 0x04, reply.size(), out));
+}
+
 void setup()
 {
     UNITY_BEGIN();
@@ -218,6 +280,11 @@ void setup()
     RUN_TEST(test_reply_from_other_slave_is_ignored);
     RUN_TEST(test_bytes_after_completion_are_ignored);
     RUN_TEST(test_never_writes_past_buffer);
+    RUN_TEST(test_recovers_reply_missing_slave_byte);
+    RUN_TEST(test_recovers_reply_missing_slave_and_function_bytes);
+    RUN_TEST(test_recovery_rejects_corrupted_payload);
+    RUN_TEST(test_recovery_rejects_other_slaves_reply);
+    RUN_TEST(test_recovery_requires_matching_length);
 
     UNITY_END();
 }
