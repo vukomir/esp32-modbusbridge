@@ -185,6 +185,11 @@ unsigned long Poller::getFailedPolls() const
     return failedPolls;
 }
 
+size_t Poller::getPendingResendCount() const
+{
+    return resendBuffer.size();
+}
+
 bool Poller::initializeInverter()
 {
     String model = config.getString("device_model", DEFAULT_DEVICE_MODEL);
@@ -260,9 +265,43 @@ void Poller::publishTelemetryPoints(const std::vector<TelemetryPoint> &points)
     // anyone could read it back.
     if (!mqtt.isConnected())
     {
-        ESPLogger::warn("MQTT not connected - skipping %u telemetry point(s)",
-                        (unsigned)points.size());
+        // Keep the values instead of dropping them. With tiered polling an
+        // energy counter is only read every 30s and a constant every few
+        // minutes; losing one here used to leave it stale in Home Assistant
+        // until its next scheduled read. They go out on the first poll that
+        // finds MQTT working again.
+        for (const auto &point : points)
+        {
+            if (!point.value.isEmpty())
+            {
+                resendBuffer.remember(point.name, point.unit, point.value);
+            }
+        }
+        ESPLogger::warn("MQTT not connected - holding %u telemetry point(s) for resend (%u held)",
+                        (unsigned)points.size(), (unsigned)resendBuffer.size());
         return;
+    }
+
+    // Resend what failed earlier - but not a value this batch is about to
+    // replace, or the stale reading would arrive and then be
+    // immediately overwritten, for nothing.
+    if (!resendBuffer.empty())
+    {
+        for (const auto &point : points)
+        {
+            if (!point.value.isEmpty())
+            {
+                resendBuffer.forget(point.name);
+            }
+        }
+        size_t resent = resendBuffer.flush([this](const TelemetryRetryBuffer::Entry &e) {
+            return mqtt.publishTelemetry(e.name, e.value, e.unit, true);
+        });
+        if (resent > 0)
+        {
+            ESPLogger::info("Resent %u telemetry point(s) that could not be published earlier (%u still held)",
+                            (unsigned)resent, (unsigned)resendBuffer.size());
+        }
     }
 
     unsigned failed = 0;
@@ -285,12 +324,13 @@ void Poller::publishTelemetryPoints(const std::vector<TelemetryPoint> &points)
                 firstFailure = point.name.c_str();
             }
             failed++;
+            resendBuffer.remember(point.name, point.unit, point.value);
         }
     }
 
     if (failed > 0)
     {
-        ESPLogger::error("Failed to publish %u of %u telemetry point(s), first: %s",
+        ESPLogger::error("Failed to publish %u of %u telemetry point(s), first: %s - held for resend",
                          failed, (unsigned)points.size(),
                          firstFailure ? firstFailure : "?");
     }

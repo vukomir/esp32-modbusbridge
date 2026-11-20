@@ -19,6 +19,7 @@ Each library has its own test directory with comprehensive test coverage:
 ### Communication Libraries  
 - `test_modbus_client/` - Modbus RTU client tests
 - `test_modbus_frame/` - Modbus RTU framing rules (hardware-free, runs on the native env)
+- `test_telemetry_retry/` - Resend buffer for telemetry that failed to publish (hardware-free)
 - `test_mqtt_client/` - MQTT client tests
 - `test_wifi_manager/` - WiFi management tests
 
