@@ -5,7 +5,7 @@
 ModbusClient::ModbusClient(Config &config)
     : config(config), serial(&Serial2), dePin(-1), ledPin(2), initialized(false),
       baudrate(9600), parity('N'), stopBits(1), dataBits(8),
-      lastError(ModbusReadError::None), lastExceptionCode(0)
+      lastError(ModbusReadError::None), lastExceptionCode(0), headerRecoveries(0), lastBusActivityMs(0)
 {
 }
 
@@ -308,6 +308,16 @@ ModbusReadError ModbusClient::readOnce(uint8_t slaveId, uint8_t function, uint16
     return result;
 }
 
+uint32_t ModbusClient::interFrameGapMs() const
+{
+    // 3.5 character times, rounded up to whole milliseconds plus one for the
+    // 1ms resolution of millis(), and never less than MIN_INTER_FRAME_GAP_MS:
+    // real devices want a little more than the bare minimum, and at high baud
+    // rates 3.5 characters is well under a millisecond.
+    uint32_t gap = frameTimeMs(4) + 1;
+    return gap < MIN_INTER_FRAME_GAP_MS ? MIN_INTER_FRAME_GAP_MS : gap;
+}
+
 uint32_t ModbusClient::frameTimeMs(size_t bytes) const
 {
     uint32_t bitsPerByte = 1 + dataBits + (parity != 'N' ? 1 : 0) + stopBits;
@@ -379,8 +389,32 @@ bool ModbusClient::sendFrame(const uint8_t *frame, size_t length)
         delay(preSilentInterval);
     }
 
+    // Modbus RTU needs at least 3.5 character times of silence between
+    // frames; a device uses that gap to recognise where one frame ends and the
+    // next begins. The receive path used to provide it by accident (it waited
+    // 10ms after every reply). Now that a reply is finished the moment its
+    // last byte arrives, the gap has to be enforced here or back-to-back
+    // requests would follow the previous reply almost immediately.
+    const unsigned long gapMs = interFrameGapMs();
+    const unsigned long sinceActivity = millis() - lastBusActivityMs;
+    if (sinceActivity < gapMs)
+    {
+        delay(gapMs - sinceActivity);
+    }
+
     // Log frame summary (reduced verbosity)
     ESPLogger::debug("Sending Modbus frame (%zu bytes)", length);
+
+    // From the last stop bit of the request until the transceiver is back in
+    // receive mode and the echo purge below has run, nothing may get in the
+    // way. If this task is preempted in that window (WiFi and MQTT share the
+    // core), DE stays asserted - or the purge runs late - while the device is
+    // already answering, and the first byte of the reply is lost. That showed
+    // up in the field as replies arriving exactly one byte short. So run the
+    // turnaround at the highest priority; flush() blocks, so other tasks still
+    // run while the request is going out.
+    UBaseType_t normalPriority = uxTaskPriorityGet(NULL); // NULL = this task
+    vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
 
     setTransmitMode();
     delayMicroseconds(50); // Minimal delay for MAX485 enable time
@@ -400,6 +434,9 @@ bool ModbusClient::sendFrame(const uint8_t *frame, size_t length)
         serial->read();
         echoBytes++;
     }
+    vTaskPrioritySet(NULL, normalPriority);
+    lastBusActivityMs = millis();
+
     if (echoBytes > 0)
     {
         ESPLogger::debug("Cleared %d echo bytes after TX->RX switch", echoBytes);
@@ -431,6 +468,11 @@ ModbusReadError ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, si
     // second would have capped throughput at ~1 byte/ms whatever the baud rate.
     ModbusFrame::Assembler frame(buffer, maxLength, slaveId, function, expectedLength);
 
+    // Everything received, unaligned. Only needed if the frame never aligns:
+    // see ModbusFrame::recoverMissingHeader().
+    uint8_t raw[256];
+    size_t rawLength = 0;
+
     const unsigned long startTime = millis();
     const unsigned long deadline = RESPONSE_TURNAROUND_MS + frameTimeMs(expectedLength) + 20;
     unsigned long lastByteTime = startTime;
@@ -445,6 +487,11 @@ ModbusReadError ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, si
                 break;
             }
             lastByteTime = millis();
+            lastBusActivityMs = lastByteTime;
+            if (rawLength < sizeof(raw))
+            {
+                raw[rawLength++] = (uint8_t)c;
+            }
             frame.push((uint8_t)c);
         }
 
@@ -458,14 +505,16 @@ ModbusReadError ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, si
         {
             break;
         }
-        if (frame.length() > 0)
+        if (rawLength > 0)
         {
-            // Mid-frame silence means the reply was cut short. The UART driver
-            // hands bytes over in chunks (when its FIFO threshold is reached or
-            // the line goes idle), so up to a chunk's worth of wire time can
-            // pass with nothing new visible here even though the device is
-            // still sending. Allow for that before giving up.
-            size_t pending = frame.remaining();
+            // Silence after something has arrived means the reply is over,
+            // whether or not it lined up as a frame. The UART driver hands
+            // bytes over in chunks (when its FIFO threshold is reached or the
+            // line goes idle), so up to a chunk's worth of wire time can pass
+            // with nothing new visible here even though the device is still
+            // sending. Allow for that before giving up.
+            size_t pending = frame.length() > 0 ? frame.remaining()
+                                                : (expectedLength > rawLength ? expectedLength - rawLength : 1);
             if (pending > 128)
             {
                 pending = 128;
@@ -482,6 +531,21 @@ ModbusReadError ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, si
     actualLength = frame.length();
     const size_t discarded = frame.discarded();
 
+    if (!frame.complete())
+    {
+        size_t recovered = ModbusFrame::recoverMissingHeader(raw, rawLength, slaveId, function,
+                                                            expectedLength, buffer);
+        if (recovered > 0)
+        {
+            // CRC already verified by recoverMissingHeader().
+            headerRecoveries++;
+            actualLength = recovered;
+            ESPLogger::debug("Reply arrived without its first %u byte(s); rebuilt and CRC-verified",
+                             (unsigned)(expectedLength - rawLength));
+            return ModbusReadError::None;
+        }
+    }
+
     if (discarded > 0)
     {
         ESPLogger::debug("Discarded %u stray byte(s) ahead of the Modbus reply", (unsigned)discarded);
@@ -494,8 +558,14 @@ ModbusReadError ModbusClient::receiveFrame(uint8_t *buffer, size_t maxLength, si
             ESPLogger::error("No response received - check device address, baud rate, and wiring");
             return ModbusReadError::Timeout;
         }
-        ESPLogger::error("Incomplete response: got %u of %u bytes (%u stray byte(s) discarded)",
-                         (unsigned)actualLength, (unsigned)expectedLength, (unsigned)discarded);
+        ESPLogger::error("Incomplete response: %u byte(s) received, %u expected, %u usable as a frame",
+                         (unsigned)rawLength, (unsigned)expectedLength, (unsigned)actualLength);
+        // Leave the raw bytes for the frame log: they are the evidence.
+        if (actualLength == 0)
+        {
+            actualLength = rawLength < maxLength ? rawLength : maxLength;
+            memcpy(buffer, raw, actualLength);
+        }
         return ModbusReadError::BadFrame;
     }
 

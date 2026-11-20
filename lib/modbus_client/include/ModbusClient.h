@@ -80,10 +80,21 @@ public:
     // reply itself needs on the wire at the configured baud rate.
     static constexpr uint32_t RESPONSE_TURNAROUND_MS = 500;
 
+    // Minimum silence kept between the end of one frame and the start of the
+    // next request (floor; the actual gap is 3.5 character times if longer).
+    static constexpr uint32_t MIN_INTER_FRAME_GAP_MS = 5;
+    uint32_t interFrameGapMs() const;
+
     // Outcome of the most recent read (see ModbusReadError).
     // virtual so test stubs can script failures without touching the UART.
     virtual ModbusReadError getLastError() const { return lastError; }
     virtual uint8_t getLastExceptionCode() const { return lastExceptionCode; }
+
+    // How many replies arrived without their first byte(s) and were rebuilt
+    // (see ModbusFrame::recoverMissingHeader). A steadily climbing number
+    // means the TX->RX turnaround is still losing bytes: look at the
+    // transceiver wiring / DE timing rather than at the bus.
+    uint32_t getHeaderRecoveryCount() const { return headerRecoveries; }
 
     // Length in bytes of a normal FC03/FC04 reply for `count` registers:
     // slave + function + byte count + 2*count data + 2 CRC.
@@ -123,6 +134,8 @@ private:
     int dataBits;
     ModbusReadError lastError;
     uint8_t lastExceptionCode;
+    uint32_t headerRecoveries;
+    unsigned long lastBusActivityMs; // last byte sent or received
 
     // Diagnostic frame logging (circular buffer, last 100 frames)
     // Using deque for O(1) pop_front instead of vector's O(n) erase
