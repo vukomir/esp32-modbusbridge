@@ -2,10 +2,58 @@
 #include <ESPLogger.h>
 #include <ArduinoJson.h>
 
+// ---------------------------------------------------------------------------
+// Locking
+//
+// PubSubClient is not thread-safe: it keeps ONE buffer for both directions and
+// writes each packet to the socket in several pieces. This wrapper is used from
+// two tasks - mqttTask runs loop() (keepalive pings, inbound packets, reconnect)
+// and pollerTask publishes telemetry - and the poller has the higher priority,
+// so it can preempt mqttTask in the middle of a packet. The result is a
+// corrupted byte stream, which the broker answers by dropping the connection.
+// At a 10s poll interval that collision was rare; at 1s, with ~60 publishes a
+// second, it showed up as failed publishes and reconnects every few minutes.
+//
+// Every use of the underlying client therefore goes through this lock. It is
+// recursive because the public methods call each other (handleConnection ->
+// publishStatus -> publishJson).
+// ---------------------------------------------------------------------------
+namespace
+{
+class MqttLock
+{
+public:
+#ifdef ESP32
+    MqttLock(SemaphoreHandle_t mutex, uint32_t timeoutMs)
+        : mutex(mutex),
+          held(mutex != NULL && xSemaphoreTakeRecursive(mutex, pdMS_TO_TICKS(timeoutMs)) == pdTRUE)
+    {
+    }
+    ~MqttLock()
+    {
+        if (held)
+        {
+            xSemaphoreGiveRecursive(mutex);
+        }
+    }
+    // True if it is safe to touch the client. If the mutex could not be
+    // created we carry on unlocked, which is no worse than before.
+    bool ok() const { return held || mutex == NULL; }
+
+private:
+    SemaphoreHandle_t mutex;
+    bool held;
+#else
+    MqttLock(void *, uint32_t) {}
+    bool ok() const { return true; }
+#endif
+};
+} // namespace
+
 MQTTClient::MQTTClient(Config &config, WiFiManager &wifiManager)
     : config(config), wifiManager(wifiManager), mqttClient(wifiClient),
       initialized(false), lastConnectAttempt(0), connectInterval(MIN_CONNECT_INTERVAL),
-      connectAttempts(0), lastStatusPublish(0)
+      connectAttempts(0), lastStatusPublish(0), clientMutex(NULL), connectedState(false)
 {
 }
 
@@ -17,6 +65,19 @@ MQTTClient::~MQTTClient()
 bool MQTTClient::begin()
 {
     ESPLogger::info("Initializing MQTT client...");
+
+#ifdef ESP32
+    // Created here rather than in the constructor: this object is a global,
+    // and its constructor runs before the RTOS is ready to hand out mutexes.
+    if (clientMutex == NULL)
+    {
+        clientMutex = xSemaphoreCreateRecursiveMutex();
+        if (clientMutex == NULL)
+        {
+            ESPLogger::error("Failed to create MQTT client mutex - continuing without locking");
+        }
+    }
+#endif
 
     if (!validateMQTTConfig())
     {
@@ -49,6 +110,14 @@ void MQTTClient::handleConnection()
         return;
     }
 
+    // Held for the whole pass. A publish from the poller waits for it (briefly
+    // - see LOCK_TIMEOUT_PUBLISH_MS) instead of cutting into loop().
+    MqttLock lock(clientMutex, LOCK_TIMEOUT_LOOP_MS);
+    if (!lock.ok())
+    {
+        return; // the poller is mid-burst; try again on the next pass
+    }
+
     // Don't attempt MQTT in AP mode or when WiFi is disconnected
     if (!wifiManager.isConnected() || wifiManager.isAPMode())
     {
@@ -58,6 +127,7 @@ void MQTTClient::handleConnection()
             ESPLogger::info("WiFi disconnected - closing MQTT connection");
             mqttClient.disconnect();
         }
+        connectedState = false;
         return;
     }
 
@@ -66,6 +136,13 @@ void MQTTClient::handleConnection()
     // Handle reconnection
     if (!mqttClient.connected())
     {
+        // Publish the state before the (slow) reconnect, so the poller skips
+        // its telemetry instead of queueing up behind the lock.
+        if (connectedState)
+        {
+            ESPLogger::warn("MQTT connection lost (state %d)", mqttClient.state());
+        }
+        connectedState = false;
         if (now - lastConnectAttempt >= connectInterval)
         {
             reconnect();
@@ -74,6 +151,8 @@ void MQTTClient::handleConnection()
     }
     else
     {
+        connectedState = true;
+
         // Periodic status publishing
         if (now - lastStatusPublish >= STATUS_PUBLISH_INTERVAL)
         {
@@ -85,11 +164,37 @@ void MQTTClient::handleConnection()
     }
 
     mqttClient.loop();
+    connectedState = mqttClient.connected();
 }
 
 bool MQTTClient::isConnected()
 {
-    return initialized && mqttClient.connected();
+    // Deliberately lock-free: this is called from several tasks, often once per
+    // telemetry point. It returns the state last observed under the lock
+    // (handleConnection runs every 200ms, and every publish refreshes it).
+    return initialized && connectedState;
+}
+
+bool MQTTClient::lockedPublish(const char *topic, const char *payload, bool retain)
+{
+    MqttLock lock(clientMutex, LOCK_TIMEOUT_PUBLISH_MS);
+    if (!lock.ok())
+    {
+        // mqttTask is holding the client, most likely reconnecting. Dropping
+        // one publish is better than stalling the Modbus poll behind it.
+        return false;
+    }
+    if (!mqttClient.connected())
+    {
+        connectedState = false;
+        return false;
+    }
+    bool ok = mqttClient.publish(topic, payload, retain);
+    if (!ok)
+    {
+        connectedState = mqttClient.connected();
+    }
+    return ok;
 }
 
 bool MQTTClient::isInitialized() const
@@ -99,11 +204,16 @@ bool MQTTClient::isInitialized() const
 
 void MQTTClient::disconnect()
 {
-    if (isConnected())
     {
-        publishStatus("offline");
-        mqttClient.disconnect();
+        MqttLock lock(clientMutex, LOCK_TIMEOUT_LOOP_MS);
+        if (lock.ok() && initialized && mqttClient.connected())
+        {
+            connectedState = true; // so the farewell below is not short-circuited
+            publishStatus("offline");
+            mqttClient.disconnect();
+        }
     }
+    connectedState = false;
     initialized = false;
 }
 
@@ -112,6 +222,14 @@ bool MQTTClient::connect()
     if (!initialized)
     {
         ESPLogger::error("MQTT connect failed - not initialized");
+        return false;
+    }
+
+    // Normally entered from handleConnection(), which already holds the lock
+    // (it is recursive); taken here as well because connect() is public.
+    MqttLock lock(clientMutex, LOCK_TIMEOUT_LOOP_MS);
+    if (!lock.ok())
+    {
         return false;
     }
 
@@ -204,6 +322,8 @@ bool MQTTClient::connect()
         }
     }
 
+    connectedState = connected;
+
     if (connected)
     {
         ESPLogger::info("MQTT connected successfully as: %s", clientId.c_str());
@@ -289,7 +409,7 @@ bool MQTTClient::publish(const String &metric, const String &value, bool retain)
     String topic = buildTopic(metric);
     bool useRetain = retain && config.getBool("retain", true);
 
-    bool success = mqttClient.publish(topic.c_str(), value.c_str(), useRetain);
+    bool success = lockedPublish(topic.c_str(), value.c_str(), useRetain);
     if (success)
     {
         ESPLogger::debug("Published: %s = %s", topic.c_str(), value.c_str());
@@ -377,7 +497,7 @@ bool MQTTClient::publishTelemetry(const String &metric, const String &value, con
         serializeJson(doc, payload);
     }
 
-    bool success = mqttClient.publish(topic.c_str(), payload.c_str(), useRetain);
+    bool success = lockedPublish(topic.c_str(), payload.c_str(), useRetain);
     if (success)
     {
         ESPLogger::debug("Published telemetry: %s = %s", topic.c_str(), payload.c_str());
@@ -400,7 +520,7 @@ bool MQTTClient::publishStatus(const String &metric, const String &value, bool r
     String topic = buildGenericTopic("status", metric);
     bool useRetain = retain && config.getBool("mqtt_retain", true);
 
-    bool success = mqttClient.publish(topic.c_str(), value.c_str(), useRetain);
+    bool success = lockedPublish(topic.c_str(), value.c_str(), useRetain);
     if (success)
     {
         ESPLogger::debug("Published status: %s = %s", topic.c_str(), value.c_str());
@@ -423,7 +543,7 @@ bool MQTTClient::publishDiagnostics(const String &metric, const String &value, b
     String topic = buildGenericTopic("diagnostics", metric);
     bool useRetain = retain && config.getBool("mqtt_retain", true);
 
-    bool success = mqttClient.publish(topic.c_str(), value.c_str(), useRetain);
+    bool success = lockedPublish(topic.c_str(), value.c_str(), useRetain);
     if (success)
     {
         ESPLogger::debug("Published diagnostics: %s = %s", topic.c_str(), value.c_str());
@@ -446,7 +566,7 @@ bool MQTTClient::publishHardware(const String &metric, const String &value, bool
     String topic = buildGenericTopic("hardware", metric);
     bool useRetain = retain && config.getBool("mqtt_retain", true);
 
-    bool success = mqttClient.publish(topic.c_str(), value.c_str(), useRetain);
+    bool success = lockedPublish(topic.c_str(), value.c_str(), useRetain);
     if (success)
     {
         ESPLogger::debug("Published hardware: %s = %s", topic.c_str(), value.c_str());
@@ -469,7 +589,7 @@ bool MQTTClient::publishConfig(const String &metric, const String &value, bool r
     String topic = buildGenericTopic("config", metric);
     bool useRetain = retain && config.getBool("mqtt_retain", true);
 
-    bool success = mqttClient.publish(topic.c_str(), value.c_str(), useRetain);
+    bool success = lockedPublish(topic.c_str(), value.c_str(), useRetain);
     if (success)
     {
         ESPLogger::debug("Published config: %s = %s", topic.c_str(), value.c_str());
@@ -512,7 +632,7 @@ bool MQTTClient::publishJson(const String &dataType, const String &metric, const
     String topic = buildGenericTopic(dataType, metric);
     bool useRetain = retain && config.getBool("mqtt_retain", true);
 
-    bool success = mqttClient.publish(topic.c_str(), jsonPayload.c_str(), useRetain);
+    bool success = lockedPublish(topic.c_str(), jsonPayload.c_str(), useRetain);
     if (success)
     {
         ESPLogger::debug("Published JSON: %s = %s", topic.c_str(), jsonPayload.c_str());
