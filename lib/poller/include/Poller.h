@@ -5,6 +5,7 @@
 #include <memory>
 #include "Config.h"
 #include "InverterInterface.h"
+#include "TelemetryRetryBuffer.h"
 #include "constants.h"
 
 // Forward declarations
@@ -29,6 +30,8 @@ public:
     unsigned long getLastPollTime() const;
     unsigned long getSuccessfulPolls() const;
     unsigned long getFailedPolls() const;
+    // Telemetry values currently waiting to be resent (see publishTelemetryPoints).
+    size_t getPendingResendCount() const;
 
 private:
     Config &config;
@@ -41,6 +44,10 @@ private:
     unsigned long successfulPolls;
     unsigned long failedPolls;
     String lastError;
+
+    // Values whose publish failed, or that were read while MQTT was down.
+    // Sent again on the next poll that finds MQTT working.
+    TelemetryRetryBuffer resendBuffer;
 
     // Availability tracking. After MAX_CONSECUTIVE_FAILURES failed polls in a row
     // we publish availability=offline so Home Assistant stops trusting retained

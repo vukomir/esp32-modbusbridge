@@ -15,6 +15,7 @@ test/
 ├── test_inverter_factory/ InverterFactory model dispatch
 ├── test_solplanet_asw/    SolPlanet ASW register parsing
 ├── test_hiking_dds238/    Hiking DDS238 meter
+├── test_telemetry_retry/  Resend buffer for telemetry that failed to publish — hardware-free
 ├── test_poller/           Poll loop + availability publishing
 ├── test_mqtt_client/      MQTT publish/subscribe — SKIPPED on native (PubSubClient not available)
 └── test_wifi_manager/     Wi-Fi STA/AP fallback — SKIPPED on native (real radio required)
