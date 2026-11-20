@@ -4,8 +4,6 @@
 #include <PubSubClient.h>
 #ifdef ESP32
 #include <WiFi.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
 #else
 #include <ESP8266WiFi.h>
 #endif
@@ -67,24 +65,6 @@ private:
     unsigned long connectInterval;
     int connectAttempts;
     unsigned long lastStatusPublish;
-
-    // Serialises every use of mqttClient across tasks (see MQTTClient.cpp).
-#ifdef ESP32
-    SemaphoreHandle_t clientMutex;
-#else
-    void *clientMutex;
-#endif
-    // Connection state as last observed under the lock; read lock-free by
-    // isConnected().
-    volatile bool connectedState;
-
-    // How long mqttTask waits for the client per pass, and how long a publish
-    // waits before giving up (it must not stall the Modbus poll).
-    static const uint32_t LOCK_TIMEOUT_LOOP_MS = 1000;
-    static const uint32_t LOCK_TIMEOUT_PUBLISH_MS = 250;
-
-    // The single place that publishes on the underlying client.
-    bool lockedPublish(const char *topic, const char *payload, bool retain);
 
     static const unsigned long MIN_CONNECT_INTERVAL = 5000;     // 5 seconds
     static const unsigned long MAX_CONNECT_INTERVAL = 300000;   // 5 minutes
