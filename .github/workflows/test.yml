@@ -28,6 +28,7 @@ jobs:
           - test_config
           - test_esplogger
           - test_modbus_client
+          - test_modbus_frame
           - test_inverter_factory
           - test_solplanet_asw
           - test_hiking_dds238
@@ -98,7 +99,7 @@ jobs:
         pip install -U platformio
 
     - name: Run native tests
-      run: pio test -e native -f test_esplogger -f test_log_store
+      run: pio test -e native -f test_esplogger -f test_log_store -f test_modbus_frame
 
   # ESP32 firmware build and test
   esp32-build:

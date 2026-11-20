@@ -9,7 +9,8 @@
 Poller::Poller(Config &config, MQTTClient &mqtt, ModbusClient &modbus)
     : config(config), mqtt(mqtt), modbus(modbus), initialized(false),
       lastPollTime(0), successfulPolls(0), failedPolls(0),
-      consecutiveFailures(0), publishedAvailability(AvailabilityState::Unknown)
+      consecutiveFailures(0), publishedAvailability(AvailabilityState::Unknown),
+      publishedPollStatus(PollStatusState::Unknown), lastPollStatusPublishMs(0)
 {
 }
 
@@ -54,13 +55,16 @@ void Poller::poll()
 
     lastPollTime = millis();
 
-    // Check hardware status first
-    ESPLogger::info("=== Hardware Status Check (Poll #%lu) ===", successfulPolls + failedPolls + 1);
+    // Check hardware status first.
+    // The routine per-poll lines below are debug, not info: at a 1s interval
+    // info would mean half a dozen identical lines every second on serial, the
+    // web log and the log store.
+    ESPLogger::debug("=== Hardware Status Check (Poll #%lu) ===", successfulPolls + failedPolls + 1);
 
     // Check if MAX485 is connected
     ESPLogger::debug("Checking MAX485 connection...");
     bool max485Connected = modbus.isMAX485Connected();
-    ESPLogger::info("MAX485 detection result: %s", max485Connected ? "CONNECTED" : "NOT CONNECTED");
+    ESPLogger::debug("MAX485 detection result: %s", max485Connected ? "CONNECTED" : "NOT CONNECTED");
 
     if (!max485Connected)
     {
@@ -75,7 +79,7 @@ void Poller::poll()
     }
 
     // MAX485 is connected, test communication
-    ESPLogger::info("✅ MAX485 module DETECTED and responding on GPIO4");
+    ESPLogger::debug("✅ MAX485 module DETECTED and responding on GPIO4");
     publishHardwareStatus("MAX485", "connected", "MAX485 module detected");
 
     // Basic hardware test first
@@ -107,7 +111,7 @@ void Poller::poll()
         successfulPolls++;
         publishPollStatus(true);
         publishHardwareStatus(deviceType, "connected", deviceModel + " responding");
-        ESPLogger::info("✅ %s CONNECTED and responding via RS485", deviceModel.c_str());
+        ESPLogger::debug("✅ %s CONNECTED and responding via RS485", deviceModel.c_str());
         ESPLogger::debug("Poll successful - Basic: %lu total", successfulPolls);
     }
     else
@@ -294,6 +298,15 @@ void Poller::publishTelemetryPoints(const std::vector<TelemetryPoint> &points)
 
 void Poller::publishPollStatus(bool success, const String &error)
 {
+    // Publish on a change of outcome, otherwise only every STATUS_REFRESH_MS
+    // so the counters in the payload stay reasonably current.
+    PollStatusState state = success ? PollStatusState::Ok : PollStatusState::Failed;
+    unsigned long nowMs = millis();
+    if (state == publishedPollStatus && nowMs - lastPollStatusPublishMs < STATUS_REFRESH_MS)
+    {
+        return;
+    }
+
     // Use ArduinoJson to avoid heap fragmentation from String concatenation
     StaticJsonDocument<256> doc;
     doc["success"] = success;
@@ -310,12 +323,36 @@ void Poller::publishPollStatus(bool success, const String &error)
     String jsonStatus;
     serializeJson(doc, jsonStatus);
 
-    // Use new generic topic structure for status
-    mqtt.publishJson(MQTT_DATA_TYPE_STATUS, MQTT_METRIC_POLL_STATUS, jsonStatus, true);
+    // Use new generic topic structure for status.
+    // Only remember it as published if it actually went out, so a publish that
+    // failed (MQTT still connecting) is retried on the next poll.
+    if (mqtt.publishJson(MQTT_DATA_TYPE_STATUS, MQTT_METRIC_POLL_STATUS, jsonStatus, true))
+    {
+        publishedPollStatus = state;
+        lastPollStatusPublishMs = nowMs;
+    }
 }
 
 void Poller::publishHardwareStatus(const String &component, const String &status, const String &message)
 {
+    HardwareStatusSlot &slot = (component == "MAX485") ? max485StatusSlot : deviceStatusSlot;
+
+    // Log transitions only, and independently of MQTT: a device that stops
+    // responding belongs in the log even while the broker is unreachable.
+    if (slot.logged != status)
+    {
+        ESPLogger::info("Hardware status: %s = %s (%s)", component.c_str(), status.c_str(), message.c_str());
+        slot.logged = status;
+    }
+
+    // The topic is retained, so it needs publishing when the status changes,
+    // plus an occasional refresh in case the broker lost its retained copy.
+    unsigned long nowMs = millis();
+    if (slot.published == status && nowMs - slot.publishedMs < STATUS_REFRESH_MS)
+    {
+        return;
+    }
+
     // Use ArduinoJson to avoid heap fragmentation
     StaticJsonDocument<256> doc;
     doc["component"] = component;
@@ -344,7 +381,11 @@ void Poller::publishHardwareStatus(const String &component, const String &status
         metric.toLowerCase();
         metric += "_status";
     }
-    mqtt.publishJson(MQTT_DATA_TYPE_HARDWARE, metric, jsonStatus, true);
-
-    ESPLogger::info("Hardware status: %s = %s (%s)", component.c_str(), status.c_str(), message.c_str());
+    // Only remember it as published if it actually went out, so a publish that
+    // failed (MQTT still connecting) is retried on the next poll.
+    if (mqtt.publishJson(MQTT_DATA_TYPE_HARDWARE, metric, jsonStatus, true))
+    {
+        slot.published = status;
+        slot.publishedMs = nowMs;
+    }
 }

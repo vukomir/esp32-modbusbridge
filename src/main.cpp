@@ -209,6 +209,18 @@ void pollerTask(void *parameter)
     int pollIntervalSec = config.getInt("poll_interval_sec", 10);
     ESPLogger::info("Poller task started with %d second interval", pollIntervalSec);
 
+    if (pollIntervalSec < 1)
+    {
+        pollIntervalSec = 1;
+    }
+
+    // Fixed-rate schedule: the interval is the period between poll STARTS.
+    // The previous vTaskDelay(interval) after each poll made the real period
+    // "interval + however long the poll took", so a 1s setting could never
+    // deliver one reading per second.
+    const TickType_t period = pdMS_TO_TICKS((uint32_t)pollIntervalSec * 1000u);
+    TickType_t lastWake = xTaskGetTickCount();
+
     for (;;)
     {
         if (poller.isInitialized())
@@ -216,7 +228,19 @@ void pollerTask(void *parameter)
             poller.poll();
         }
 
-        vTaskDelay(pdMS_TO_TICKS(pollIntervalSec * 1000));
+        // If a poll overran its slot (retries on a noisy bus, a slow first
+        // sweep after boot), start the next one after a short breather and
+        // re-anchor the schedule there. Without this vTaskDelayUntil would
+        // return immediately for every missed slot and fire a burst of
+        // back-to-back polls to "catch up".
+        if ((TickType_t)(xTaskGetTickCount() - lastWake) >= period)
+        {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            lastWake = xTaskGetTickCount();
+            continue;
+        }
+
+        vTaskDelayUntil(&lastWake, period);
     }
 }
 

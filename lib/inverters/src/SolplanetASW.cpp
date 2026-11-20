@@ -11,9 +11,74 @@
 
 SolplanetASW::SolplanetASW(ModbusClient &modbus, Config &config)
     : modbus(modbus), config(config), slaveAddr(1), isThreePhase(false), phaseDetected(false),
-      mpptCount(0), stringCount(0), configDetected(false)
+      mpptCount(0), stringCount(0), configDetected(false),
+      baseIntervalMs(10000), mediumIntervalMs(10000), slowIntervalMs(30000),
+      coalesce(true), maxSpan(MAX_SPAN), longFrameStrikes(0)
 {
     slaveAddr = config.getInt("rtu_addr", 1);
+
+    // Tier periods. Read once: like the poll interval itself, a change takes
+    // effect on the next restart.
+    int baseSec = config.getInt("poll_interval_sec", 10);
+    int mediumSec = config.getInt("poll_medium_interval_sec", 10);
+    int slowSec = config.getInt("poll_slow_interval_sec", 30);
+    if (baseSec < 1) baseSec = 1;
+    if (mediumSec < 1) mediumSec = 1;
+    if (slowSec < 1) slowSec = 1;
+    baseIntervalMs = (uint32_t)baseSec * 1000u;
+    mediumIntervalMs = (uint32_t)mediumSec * 1000u;
+    slowIntervalMs = (uint32_t)slowSec * 1000u;
+
+    // ---- Register map ------------------------------------------------------
+    // MUST stay sorted by register address: neighbouring blocks that are due in
+    // the same cycle are merged into one transaction, and the merge only looks
+    // at the next entry.
+    //
+    // Constants: read at boot, then every 10x the slow interval.
+    addBlock(31002, 1, TIER_STATIC, 0, &SolplanetASW::parseModbusAddress);
+    addBlock(31027, 1, TIER_STATIC, 0, &SolplanetASW::parseGridCode);
+    addBlock(31301, 2, TIER_STATIC, 0, &SolplanetASW::parseRatedValues);
+    // AC energy today/total and operating hours. 0.1 kWh resolution, so they
+    // change at most every few seconds even at full power.
+    addBlock(31303, 6, TIER_SLOW, 0, &SolplanetASW::parseEnergyCounters);
+    // Device state, connect time, temperatures, bus voltage.
+    addBlock(31309, 9, TIER_MEDIUM, 0, &SolplanetASW::parseDeviceStatus);
+    // Live PV and grid values. 31319-31379 is one contiguous span, so on a
+    // normal cycle these three blocks are a single 61-register read.
+    addBlock(31319, 20, TIER_FAST, BLOCK_REQUIRED, &SolplanetASW::parsePVInputs);
+    addBlock(31339, 20, TIER_FAST, BLOCK_STRINGS, &SolplanetASW::parseStringCurrents);
+    addBlock(31359, 21, TIER_FAST, BLOCK_REQUIRED, &SolplanetASW::parseGridAndPhase);
+    addBlock(31391, 1, TIER_MEDIUM, 0, &SolplanetASW::parseGridConnection);
+    // PV total power. The PV-side energy counters share the block and come
+    // along for the cost of four extra registers.
+    addBlock(31601, 6, TIER_FAST, 0, &SolplanetASW::parsePVTotals);
+    addBlock(31607, 23, TIER_MEDIUM, BLOCK_STORAGE, &SolplanetASW::parseBattery);
+    addBlock(31630, 4, TIER_SLOW, 0, &SolplanetASW::parseAcEnergy);
+    // EPS (backup output) load and per-phase grid power: 31634-31674 is one
+    // contiguous 41-register read on a 3-phase hybrid.
+    addBlock(31634, 3, TIER_FAST, 0, &SolplanetASW::parseEpsBasic);
+    addBlock(31637, 8, TIER_FAST, 0, &SolplanetASW::parseEpsPower);
+    addBlock(31645, 18, TIER_FAST, BLOCK_THREE_PHASE, &SolplanetASW::parseEpsPhases);
+    addBlock(31663, 12, TIER_FAST, BLOCK_THREE_PHASE, &SolplanetASW::parseGridPhasePower);
+    addBlock(31675, 4, TIER_SLOW, 0, &SolplanetASW::parseGridExport);
+    addBlock(31679, 3, TIER_SLOWER, BLOCK_STORAGE, &SolplanetASW::parseBmsDiagnostics);
+    addBlock(31685, 3, TIER_SLOW, BLOCK_STORAGE, &SolplanetASW::parseGenerator);
+}
+
+void SolplanetASW::addBlock(uint16_t reg, uint8_t count, Tier tier, uint8_t flags, BlockParser parse)
+{
+    Block b;
+    b.reg = reg;
+    b.count = count;
+    b.tier = (uint8_t)tier;
+    b.flags = flags;
+    b.parse = parse;
+    b.nextDueMs = 0;
+    b.scheduled = false;
+    b.everRead = false;
+    b.unsupported = false;
+    b.failStreak = 0;
+    blocks.push_back(b);
 }
 
 bool SolplanetASW::begin()
@@ -25,6 +90,10 @@ bool SolplanetASW::begin()
         ESPLogger::error("Modbus client not initialized");
         return false;
     }
+
+    ESPLogger::info("Polling tiers: fast %lus, medium %lus, slow %lus",
+                    (unsigned long)(baseIntervalMs / 1000), (unsigned long)(mediumIntervalMs / 1000),
+                    (unsigned long)(slowIntervalMs / 1000));
 
     // Detect phase configuration
     if (!detectPhaseConfiguration())
@@ -147,6 +216,161 @@ uint16_t SolplanetASW::inputRegisterToModbus(uint16_t inputRegister) const
     return inputRegister - 30001;
 }
 
+// ===========================================================================
+// Tiered block scheduler
+// ===========================================================================
+
+uint32_t SolplanetASW::tierPeriodMs(uint8_t tier) const
+{
+    switch (tier)
+    {
+    case TIER_MEDIUM: return mediumIntervalMs;
+    case TIER_SLOW:   return slowIntervalMs;
+    case TIER_SLOWER: return slowIntervalMs * 2u;
+    case TIER_STATIC: return slowIntervalMs * 10u;
+    default:          return 0; // TIER_FAST: every cycle
+    }
+}
+
+bool SolplanetASW::blockEnabled(const Block &b, bool storageEnabled) const
+{
+    if ((b.flags & BLOCK_THREE_PHASE) && !isThreePhase) return false;
+    if ((b.flags & BLOCK_STRINGS) && stringCount == 0) return false;
+    if ((b.flags & BLOCK_STORAGE) && !storageEnabled) return false;
+    return true;
+}
+
+bool SolplanetASW::blockDue(const Block &b, uint32_t now) const
+{
+    if (!b.scheduled)
+    {
+        return true;
+    }
+    // Signed difference so the comparison survives millis() wrapping.
+    return (int32_t)(now - b.nextDueMs) >= 0;
+}
+
+size_t SolplanetASW::runEnd(const bool *selected, size_t first) const
+{
+    size_t end = first + 1;
+    // A parked block is probed on its own: merging it would take its healthy
+    // neighbours down with it.
+    if (!coalesce || blocks[first].unsupported)
+    {
+        return end;
+    }
+
+    uint16_t nextReg = blocks[first].reg + blocks[first].count;
+    uint16_t total = blocks[first].count;
+    while (end < blocks.size() && selected[end] && !blocks[end].unsupported &&
+           blocks[end].reg == nextReg && total + blocks[end].count <= maxSpan)
+    {
+        nextReg += blocks[end].count;
+        total += blocks[end].count;
+        end++;
+    }
+    return end;
+}
+
+uint32_t SolplanetASW::estimateCycleMs(const bool *selected) const
+{
+    // Wire time is exact for the configured baud rate. The fixed part per
+    // transaction (inverter turnaround plus transceiver switching) is an
+    // allowance, not a measurement.
+    static const uint32_t PER_TRANSACTION_OVERHEAD_MS = 40;
+
+    uint32_t total = 0;
+    size_t i = 0;
+    while (i < blocks.size())
+    {
+        if (!selected[i])
+        {
+            i++;
+            continue;
+        }
+        size_t end = runEnd(selected, i);
+        uint16_t count = 0;
+        for (size_t k = i; k < end; k++)
+        {
+            count += blocks[k].count;
+        }
+        total += PER_TRANSACTION_OVERHEAD_MS + modbus.frameTimeMs(8 + ModbusClient::responseLength(count));
+        i = end;
+    }
+    return total;
+}
+
+void SolplanetASW::markRead(Block &b, uint32_t now)
+{
+    if (b.unsupported)
+    {
+        ESPLogger::info("Register block %u-%u is answering again", b.reg, b.reg + b.count - 1);
+    }
+    b.everRead = true;
+    b.unsupported = false;
+    b.failStreak = 0;
+    b.scheduled = true;
+
+    uint32_t period = tierPeriodMs(b.tier);
+    // Due a little early rather than a whole cycle late: poll cycles are not
+    // perfectly periodic, and a 10s block that lands at 9.99s should be read
+    // on that cycle, not the one after.
+    uint32_t tolerance = period / 10;
+    if (tolerance > 200) tolerance = 200;
+    b.nextDueMs = now + period - tolerance;
+}
+
+void SolplanetASW::markFailed(Block &b, uint32_t now, ModbusReadError error)
+{
+    if (b.failStreak < 255)
+    {
+        b.failStreak++;
+    }
+    b.scheduled = true;
+
+    // The inverter said no (exception), or an optional block has now failed
+    // several times running. Either way stop paying for it on every cycle.
+    // Required blocks are never parked: if they fail, the poll fails and the
+    // availability topic takes it from there.
+    bool park = (error == ModbusReadError::Exception) ||
+                (!(b.flags & BLOCK_REQUIRED) && b.failStreak >= UNSUPPORTED_AFTER_FAILURES);
+    if (park && !(b.flags & BLOCK_REQUIRED))
+    {
+        if (!b.unsupported)
+        {
+            ESPLogger::info("Register block %u-%u not available on this inverter (%s); next probe in %lu min",
+                            b.reg, b.reg + b.count - 1,
+                            error == ModbusReadError::Exception ? "Modbus exception" : "repeated failures",
+                            (unsigned long)(UNSUPPORTED_RETRY_MS / 60000));
+        }
+        b.unsupported = true;
+        b.nextDueMs = now + UNSUPPORTED_RETRY_MS;
+        return;
+    }
+
+    // Transient failure: fast blocks simply come round again next cycle; slower
+    // ones are retried soon instead of waiting out their whole period.
+    uint32_t retry = tierPeriodMs(b.tier);
+    if (retry > 5000) retry = 5000;
+    b.nextDueMs = now + retry;
+}
+
+bool SolplanetASW::readBlockAlone(Block &b, uint32_t now, std::vector<TelemetryPoint> &out)
+{
+    uint16_t buf[MAX_SPAN];
+    // A block that is already failing gets one attempt, not three: if it is
+    // genuinely absent the retries only delay everything behind it.
+    uint8_t attempts = (b.failStreak > 0 || b.unsupported) ? 1 : ModbusClient::MAX_READ_ATTEMPTS;
+    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(b.reg), b.count, buf, attempts))
+    {
+        (this->*b.parse)(buf, out);
+        markRead(b, now);
+        return true;
+    }
+    markFailed(b, now, modbus.getLastError());
+    return false;
+}
+
 bool SolplanetASW::readBasic(std::vector<TelemetryPoint> &out)
 {
     out.clear();
@@ -164,137 +388,309 @@ bool SolplanetASW::readBasic(std::vector<TelemetryPoint> &out)
         detectDeviceConfiguration(); // Non-fatal if it fails, uses defaults
     }
 
-    bool success = true;
+    const uint32_t now = millis();
+    const bool storageEnabled = config.getBool("read_storage_regs", false);
+    const size_t n = blocks.size() < MAX_BLOCKS ? blocks.size() : MAX_BLOCKS;
 
-    // Read device information
-    if (!readDeviceInfo(out))
+    // ---- 1. Which blocks are due? ------------------------------------------
+    bool selected[MAX_BLOCKS] = {false};
+    uint8_t deferrable[MAX_BLOCKS];
+    size_t deferrableCount = 0;
+
+    for (size_t i = 0; i < n; i++)
     {
-        ESPLogger::warn("Failed to read device info");
-        success = false;
-    }
-
-    // Read basic measurements (energy, state, temperatures)
-    if (!readBasicMeasurements(out))
-    {
-        ESPLogger::warn("Failed to read basic measurements");
-        success = false;
-    }
-
-    // Read PV input data
-    if (!readPVInputs(out))
-    {
-        ESPLogger::warn("Failed to read PV inputs");
-        success = false;
-    }
-
-    // Read grid/AC measurements and 3-phase data (combined bulk read)
-    if (!readGridAndPhaseMeasurements(out))
-    {
-        ESPLogger::warn("Failed to read grid/phase measurements");
-        success = false;
-    }
-
-    // Read grid energy, consumption, and EPS load data
-    if (!readGridEnergyAndLoad(out))
-    {
-        ESPLogger::warn("Failed to read grid energy/load data");
-        success = false;
-    }
-
-    // Note: Temperatures are now included in readBasicMeasurements bulk read
-
-    ESPLogger::info("Read %d telemetry points (%s)", out.size(), isThreePhase ? "3-phase" : "1-phase");
-    return success && !out.empty();
-}
-
-bool SolplanetASW::readDeviceInfo(std::vector<TelemetryPoint> &out)
-{
-    // BULK READ OPTIMIZATION: Read 2 separate single registers
-    // These are non-contiguous so we keep them as individual reads
-
-    // Register 31002: Modbus address (U16)
-    uint16_t modbusAddr;
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31002), 1, &modbusAddr))
-    {
-        if (!isNaN_U16(modbusAddr))
+        const Block &b = blocks[i];
+        if (!blockEnabled(b, storageEnabled) || !blockDue(b, now))
         {
-            out.push_back(TP_FULL("modbus_address", "", String(modbusAddr), 31002, "U16", 1.0f));
-            ESPLogger::debug("Modbus address: %u", modbusAddr);
+            continue;
+        }
+        // Fast blocks always go. So does anything not yet read once, so the
+        // first cycle after boot publishes the complete picture.
+        if (b.tier == TIER_FAST || (!b.everRead && !b.unsupported))
+        {
+            selected[i] = true;
+        }
+        else
+        {
+            deferrable[deferrableCount++] = (uint8_t)i;
         }
     }
 
-    // Register 31027: Current grid code (E16)
-    uint16_t gridCode;
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31027), 1, &gridCode))
+    // ---- 2. Fit the slower blocks into what is left of the cycle ------------
+    // Most overdue first. A block that does not fit stays due and is picked up
+    // on a following cycle, which also spreads blocks sharing a period across
+    // different cycles instead of bunching them on the same one.
+    for (size_t a = 1; a < deferrableCount; a++)
     {
-        if (!isNaN_U16(gridCode))
+        uint8_t v = deferrable[a];
+        int32_t overdue = (int32_t)(now - blocks[v].nextDueMs);
+        size_t k = a;
+        while (k > 0 && (int32_t)(now - blocks[deferrable[k - 1]].nextDueMs) < overdue)
         {
-            out.push_back(TP_FULL("grid_code", "", String(gridCode), 31027, "E16", 1.0f));
+            deferrable[k] = deferrable[k - 1];
+            k--;
+        }
+        deferrable[k] = v;
+    }
 
-            // Add human-readable grid code description
-            String gridDesc = getGridCodeDescription(gridCode);
-            if (gridDesc.length() > 0)
+    const uint32_t budgetMs = baseIntervalMs / 10u * 7u;
+    bool slowTaken = false;
+    size_t deferred = 0;
+    for (size_t a = 0; a < deferrableCount; a++)
+    {
+        uint8_t i = deferrable[a];
+        selected[i] = true;
+        // The first one is always taken, so the slow tiers cannot be starved
+        // even if the fast tier alone fills the cycle.
+        if (slowTaken && estimateCycleMs(selected) > budgetMs)
+        {
+            selected[i] = false;
+            deferred++;
+        }
+        else
+        {
+            slowTaken = true;
+        }
+    }
+
+    // ---- 3. Read, merging neighbours into single transactions ---------------
+    bool requiredFailed = false;
+    bool aborted = false;
+    size_t blocksOk = 0;
+    size_t transactions = 0;
+    uint16_t buf[MAX_SPAN];
+
+    size_t i = 0;
+    while (i < n)
+    {
+        if (!selected[i])
+        {
+            i++;
+            continue;
+        }
+        size_t end = runEnd(selected, i);
+        if (end > n) end = n;
+
+        bool runRequired = false;
+        uint16_t total = 0;
+        for (size_t k = i; k < end; k++)
+        {
+            total += blocks[k].count;
+            if (blocks[k].flags & BLOCK_REQUIRED) runRequired = true;
+        }
+
+        if (aborted)
+        {
+            // The device stopped answering earlier in this cycle. Do not sit
+            // through a timeout for every remaining block as well.
+            for (size_t k = i; k < end; k++)
             {
-                out.push_back(TP_FULL("grid_code_standard", "", gridDesc, 31027, "E16", 1.0f));
+                markFailed(blocks[k], now, ModbusReadError::Timeout);
+            }
+            if (runRequired) requiredFailed = true;
+            i = end;
+            continue;
+        }
+
+        if (end - i == 1)
+        {
+            transactions++;
+            if (readBlockAlone(blocks[i], now, out))
+            {
+                blocksOk++;
+            }
+            else
+            {
+                if (runRequired)
+                {
+                    requiredFailed = true;
+                    if (modbus.getLastError() == ModbusReadError::Timeout) aborted = true;
+                }
+            }
+            i = end;
+            continue;
+        }
+
+        // Merged read of blocks i..end-1.
+        transactions++;
+        if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(blocks[i].reg), total, buf))
+        {
+            uint16_t offset = 0;
+            for (size_t k = i; k < end; k++)
+            {
+                (this->*blocks[k].parse)(buf + offset, out);
+                offset += blocks[k].count;
+                markRead(blocks[k], now);
+                blocksOk++;
+            }
+            longFrameStrikes = 0;
+            i = end;
+            continue;
+        }
+
+        ModbusReadError mergedError = modbus.getLastError();
+        if (mergedError == ModbusReadError::Timeout)
+        {
+            // Nothing came back at all. Splitting the read would only repeat
+            // the same silence once per block.
+            for (size_t k = i; k < end; k++)
+            {
+                markFailed(blocks[k], now, mergedError);
+            }
+            if (runRequired)
+            {
+                requiredFailed = true;
+                aborted = true;
+            }
+            i = end;
+            continue;
+        }
+
+        // Exception or corrupt frame on the merged read. Read the parts one by
+        // one: that still delivers this cycle's data and shows which part, if
+        // any, is the problem.
+        bool allPartsOk = true;
+        for (size_t k = i; k < end; k++)
+        {
+            if (aborted)
+            {
+                markFailed(blocks[k], now, ModbusReadError::Timeout);
+                if (blocks[k].flags & BLOCK_REQUIRED) requiredFailed = true;
+                allPartsOk = false;
+                continue;
+            }
+            transactions++;
+            if (readBlockAlone(blocks[k], now, out))
+            {
+                blocksOk++;
+            }
+            else
+            {
+                allPartsOk = false;
+                if (blocks[k].flags & BLOCK_REQUIRED)
+                {
+                    requiredFailed = true;
+                    if (modbus.getLastError() == ModbusReadError::Timeout) aborted = true;
+                }
             }
         }
+
+        if (allPartsOk)
+        {
+            if (mergedError == ModbusReadError::Exception)
+            {
+                // Every part is fine on its own but the inverter refuses them
+                // together. Stop merging.
+                coalesce = false;
+                ESPLogger::warn("Inverter rejects merged read %u-%u but accepts its parts; "
+                                "reading blocks individually from now on",
+                                blocks[i].reg, blocks[end - 1].reg + blocks[end - 1].count - 1);
+            }
+            else if (++longFrameStrikes >= 3 && maxSpan > MIN_SPAN)
+            {
+                maxSpan = (maxSpan / 2 < MIN_SPAN) ? MIN_SPAN : maxSpan / 2;
+                longFrameStrikes = 0;
+                ESPLogger::warn("Long reads keep failing on the bus while short ones succeed; "
+                                "limiting reads to %u registers", maxSpan);
+            }
+        }
+        i = end;
     }
 
+    ESPLogger::debug("Read %u telemetry points from %u block(s) in %u transaction(s), %u deferred (%s)",
+                     (unsigned)out.size(), (unsigned)blocksOk, (unsigned)transactions,
+                     (unsigned)deferred, isThreePhase ? "3-phase" : "1-phase");
+
+    return !requiredFailed && blocksOk > 0;
+}
+
+bool SolplanetASW::readStorage(std::vector<TelemetryPoint> &out)
+{
+    // Battery blocks are read by readBasic() on their own tier, so they can
+    // share a transaction with the registers either side of them.
+    out.clear();
     return true;
 }
 
-bool SolplanetASW::readBasicMeasurements(std::vector<TelemetryPoint> &out)
-{
-    // BULK READ OPTIMIZATION: Read 31301-31320 in one transaction (20 registers)
-    // Covers: grid voltage/freq, energy, hours, state, connect time, temperatures, bus voltage, PV1
-    uint16_t bulk[20];
-    if (!modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31301), 20, bulk))
-    {
-        ESPLogger::error("Bulk read 31301-31320 failed");
-        return false;
-    }
+// ===========================================================================
+// Block parsers. `r` points at the first register of the block.
+// ===========================================================================
 
-    // Index 0: 31301 - Grid rated voltage (U16, V, scale 0.1)
-    if (!isNaN_U16(bulk[0]))
+void SolplanetASW::parseModbusAddress(const uint16_t *r, std::vector<TelemetryPoint> &out)
+{
+    // 31002: Modbus address (U16)
+    if (!isNaN_U16(r[0]))
     {
-        float voltage = bulk[0] * 0.1f;
+        out.push_back(TP_FULL("modbus_address", "", String(r[0]), 31002, "U16", 1.0f));
+    }
+}
+
+void SolplanetASW::parseGridCode(const uint16_t *r, std::vector<TelemetryPoint> &out)
+{
+    // 31027: Current grid code (E16)
+    uint16_t gridCode = r[0];
+    if (!isNaN_U16(gridCode))
+    {
+        out.push_back(TP_FULL("grid_code", "", String(gridCode), 31027, "E16", 1.0f));
+
+        // Add human-readable grid code description
+        String gridDesc = getGridCodeDescription(gridCode);
+        if (gridDesc.length() > 0)
+        {
+            out.push_back(TP_FULL("grid_code_standard", "", gridDesc, 31027, "E16", 1.0f));
+        }
+    }
+}
+
+void SolplanetASW::parseRatedValues(const uint16_t *r, std::vector<TelemetryPoint> &out)
+{
+    // 31301 - Grid rated voltage (U16, V, scale 0.1)
+    if (!isNaN_U16(r[0]))
+    {
+        float voltage = r[0] * 0.1f;
         out.push_back(TP_FULL("grid_rated_voltage", "V", String(voltage, 1), 31301, "U16", 0.1f));
     }
 
-    // Index 1: 31302 - Grid rated frequency (U16, Hz, scale 0.01)
-    if (!isNaN_U16(bulk[1]))
+    // 31302 - Grid rated frequency (U16, Hz, scale 0.01)
+    if (!isNaN_U16(r[1]))
     {
-        float freq = bulk[1] * 0.01f;
+        float freq = r[1] * 0.01f;
         out.push_back(TP_FULL("grid_rated_frequency", "Hz", String(freq, 2), 31302, "U16", 0.01f));
     }
+}
 
-    // Index 2-3: 31303-31304 - Today's energy (U32, kWh, scale 0.1)
-    uint32_t todayEnergy = ((uint32_t)bulk[2] << 16) | bulk[3];
+void SolplanetASW::parseEnergyCounters(const uint16_t *r, std::vector<TelemetryPoint> &out)
+{
+    // 31303-31304 - Today's energy (U32, kWh, scale 0.1)
+    uint32_t todayEnergy = ((uint32_t)r[0] << 16) | r[1];
     if (!isNaN_U32(todayEnergy))
     {
         float energyKwh = todayEnergy * 0.1f;
         out.push_back(TP_FULL("energy_today", "kWh", String(energyKwh, 1), 31303, "U32", 0.1f));
     }
 
-    // Index 4-5: 31305-31306 - Total energy (U32, kWh, scale 0.1)
-    uint32_t totalEnergy = ((uint32_t)bulk[4] << 16) | bulk[5];
+    // 31305-31306 - Total energy (U32, kWh, scale 0.1)
+    uint32_t totalEnergy = ((uint32_t)r[2] << 16) | r[3];
     if (!isNaN_U32(totalEnergy))
     {
         float energyKwh = totalEnergy * 0.1f;
         out.push_back(TP_FULL("energy_total", "kWh", String(energyKwh, 1), 31305, "U32", 0.1f));
     }
 
-    // Index 6-7: 31307-31308 - Total hours (U32, hours, scale 1.0)
-    uint32_t hours = ((uint32_t)bulk[6] << 16) | bulk[7];
+    // 31307-31308 - Total hours (U32, hours, scale 1.0)
+    uint32_t hours = ((uint32_t)r[4] << 16) | r[5];
     if (!isNaN_U32(hours))
     {
         out.push_back(TP_FULL("hours_total", "h", String(hours), 31307, "U32", 1.0f));
     }
+}
 
-    // Index 8: 31309 - Device state (E16)
-    if (!isNaN_U16(bulk[8]))
+void SolplanetASW::parseDeviceStatus(const uint16_t *r, std::vector<TelemetryPoint> &out)
+{
+    // Index 0: 31309 - Device state (E16)
+    if (!isNaN_U16(r[0]))
     {
-        uint16_t deviceState = bulk[8];
+        uint16_t deviceState = r[0];
         out.push_back(TP_FULL("device_state", "", String(deviceState), 31309, "E16", 1.0f));
         String stateStr;
         switch (deviceState)
@@ -313,71 +709,57 @@ bool SolplanetASW::readBasicMeasurements(std::vector<TelemetryPoint> &out)
         out.push_back(TP_FULL("device_state_text", "", stateStr, 31309, "E16", 1.0f));
     }
 
-    // Index 9: 31310 - Connect time (U16, seconds)
-    if (!isNaN_U16(bulk[9]))
+    // Index 1: 31310 - Connect time (U16, seconds)
+    if (!isNaN_U16(r[1]))
     {
-        out.push_back(TP_FULL("connect_time", "s", String(bulk[9]), 31310, "U16", 1.0f));
+        out.push_back(TP_FULL("connect_time", "s", String(r[1]), 31310, "U16", 1.0f));
     }
 
-    // Index 10: 31311 - Internal temperature (S16, °C, scale 0.1)
-    int16_t tempInternal = (int16_t)bulk[10];
+    // Index 2: 31311 - Internal temperature (S16, °C, scale 0.1)
+    int16_t tempInternal = (int16_t)r[2];
     if (!isNaN_S16(tempInternal))
     {
         float temperature = tempInternal * 0.1f;
         out.push_back(TP_FULL("temperature_internal", "C", String(temperature, 1), 31311, "S16", 0.1f));
     }
 
-    // Index 11: 31312 - Inverter U phase temperature (S16, °C, scale 0.1)
-    int16_t tempInverterU = (int16_t)bulk[11];
+    // Index 3: 31312 - Inverter U phase temperature (S16, °C, scale 0.1)
+    int16_t tempInverterU = (int16_t)r[3];
     if (!isNaN_S16(tempInverterU))
     {
         float temperature = tempInverterU * 0.1f;
         out.push_back(TP_FULL("temperature_inverter_u", "C", String(temperature, 1), 31312, "S16", 0.1f));
     }
 
-    // Index 12-13: 31313-31314 - Unused/gaps, skip
+    // Index 4-5: 31313-31314 - Unused/gaps, skip
 
-    // Index 14: 31315 - Boost temperature (S16, °C, scale 0.1)
-    int16_t tempBoost = (int16_t)bulk[14];
+    // Index 6: 31315 - Boost temperature (S16, °C, scale 0.1)
+    int16_t tempBoost = (int16_t)r[6];
     if (!isNaN_S16(tempBoost))
     {
         float temperature = tempBoost * 0.1f;
         out.push_back(TP_FULL("temperature_boost", "C", String(temperature, 1), 31315, "S16", 0.1f));
     }
 
-    // Index 15: 31316 - Unused/gap, skip
+    // Index 7: 31316 - Unused/gap, skip
 
-    // Index 16: 31317 - Bus voltage (U16, V, scale 0.1)
-    if (!isNaN_U16(bulk[16]))
+    // Index 8: 31317 - Bus voltage (U16, V, scale 0.1)
+    if (!isNaN_U16(r[8]))
     {
-        float voltage = bulk[16] * 0.1f;
+        float voltage = r[8] * 0.1f;
         out.push_back(TP_FULL("bus_voltage", "V", String(voltage, 1), 31317, "U16", 0.1f));
     }
-
-    // Index 17: 31318 - Unused/gap, skip
-
-    // Index 18-19: 31319-31320 - PV1 voltage/current handled in readPVInputs
-
-    return true;
 }
 
-bool SolplanetASW::readPVInputs(std::vector<TelemetryPoint> &out)
+void SolplanetASW::parsePVInputs(const uint16_t *r, std::vector<TelemetryPoint> &out)
 {
-    // BULK READ OPTIMIZATION: Read 31319-31338 in one transaction (20 registers = 10 MPPT inputs)
-    // Covers PV1 through PV10 voltage/current pairs
-    uint16_t pvBulk[20];
-    if (!modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31319), 20, pvBulk))
-    {
-        ESPLogger::error("Bulk read 31319-31338 (PV inputs) failed");
-        return false;
-    }
-
+    // 31319-31338: PV1 through PV10 voltage/current pairs.
     // Parse MPPT inputs dynamically based on detected count
     for (uint8_t i = 0; i < mpptCount && i < 10; i++)
     {
         uint16_t pvBaseReg = 31319 + (i * 2);
-        uint16_t voltage_raw = pvBulk[i * 2];
-        uint16_t current_raw = pvBulk[i * 2 + 1];
+        uint16_t voltage_raw = r[i * 2];
+        uint16_t current_raw = r[i * 2 + 1];
 
         if (!isNaN_U16(voltage_raw) && !isNaN_U16(current_raw))
         {
@@ -394,78 +776,29 @@ bool SolplanetASW::readPVInputs(std::vector<TelemetryPoint> &out)
             }
         }
     }
-
-    // BULK READ OPTIMIZATION: Read string currents 31339-31358 in one transaction (20 registers)
-    if (stringCount > 0)
-    {
-        uint16_t stringBulk[20];
-        if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31339), 20, stringBulk))
-        {
-            for (uint8_t i = 0; i < stringCount && i < 20; i++)
-            {
-                uint16_t stringReg = 31339 + i;
-                if (!isNaN_U16(stringBulk[i]))
-                {
-                    float current = stringBulk[i] * 0.1f;
-                    if (current > 0.1f)
-                    {
-                        String stringNum = String(i + 1);
-                        out.push_back(TP_FULL("string" + stringNum + "_current", "A", String(current, 1), stringReg, "U16", 0.1f));
-                    }
-                }
-            }
-        }
-        else
-        {
-            ESPLogger::warn("Bulk read 31339-31358 (string currents) failed");
-        }
-    }
-
-    // BULK READ OPTIMIZATION: Read 31601-31606 in one transaction (6 registers)
-    // Covers: PV total power and PV-side energy (DC side, before inverter conversion)
-    uint16_t pvEnergyBulk[6];
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31601), 6, pvEnergyBulk))
-    {
-        // Index 0-1: 31601-31602 - PV total power (U32, W, scale 1.0)
-        uint32_t pvPower = ((uint32_t)pvEnergyBulk[0] << 16) | pvEnergyBulk[1];
-        if (!isNaN_U32(pvPower))
-        {
-            out.push_back(TP_FULL("pv_total_power", "W", String(pvPower), 31601, "U32", 1.0f));
-        }
-
-        // Index 2-3: 31603-31604 - PV E-Today (U32, kWh, scale 0.1)
-        // This is DC-side energy before inverter losses
-        uint32_t pvEnergyToday = ((uint32_t)pvEnergyBulk[2] << 16) | pvEnergyBulk[3];
-        if (!isNaN_U32(pvEnergyToday))
-        {
-            float energyKwh = pvEnergyToday * 0.1f;
-            out.push_back(TP_FULL("pv_energy_today", "kWh", String(energyKwh, 1), 31603, "U32", 0.1f));
-        }
-
-        // Index 4-5: 31605-31606 - PV E-Total (U32, kWh, scale 0.1)
-        // Total lifetime PV energy on DC side
-        uint32_t pvEnergyTotal = ((uint32_t)pvEnergyBulk[4] << 16) | pvEnergyBulk[5];
-        if (!isNaN_U32(pvEnergyTotal))
-        {
-            float energyKwh = pvEnergyTotal * 0.1f;
-            out.push_back(TP_FULL("pv_energy_total", "kWh", String(energyKwh, 1), 31605, "U32", 0.1f));
-        }
-    }
-
-    return true;
 }
 
-bool SolplanetASW::readGridAndPhaseMeasurements(std::vector<TelemetryPoint> &out)
+void SolplanetASW::parseStringCurrents(const uint16_t *r, std::vector<TelemetryPoint> &out)
 {
-    // BULK READ OPTIMIZATION: Read 31359-31379 in ONE transaction (21 registers)
-    // Covers: 3-phase data, grid measurements, AND detailed error/warning codes
-    uint16_t bulk[21];
-    if (!modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31359), 21, bulk))
+    // 31339-31358: individual string currents (U16, A, scale 0.1)
+    for (uint8_t i = 0; i < stringCount && i < 20; i++)
     {
-        ESPLogger::error("Bulk read 31359-31379 (grid + phase + errors) failed");
-        return false;
+        uint16_t stringReg = 31339 + i;
+        if (!isNaN_U16(r[i]))
+        {
+            float current = r[i] * 0.1f;
+            if (current > 0.1f)
+            {
+                String stringNum = String(i + 1);
+                out.push_back(TP_FULL("string" + stringNum + "_current", "A", String(current, 1), stringReg, "U16", 0.1f));
+            }
+        }
     }
+}
 
+void SolplanetASW::parseGridAndPhase(const uint16_t *bulk, std::vector<TelemetryPoint> &out)
+{
+    // 31359-31379 (21 registers): 3-phase data, grid measurements, error/warning codes
     // === THREE-PHASE DATA (only if 3-phase inverter) ===
     if (isThreePhase)
     {
@@ -595,318 +928,62 @@ bool SolplanetASW::readGridAndPhaseMeasurements(std::vector<TelemetryPoint> &out
             out.push_back(TP_FULL("warning_message", "", warningDesc, 31379, "E16", 1.0f));
         }
     }
-
-    // Grid connection status (separate read, non-contiguous at 31391)
-    uint16_t gridStatus;
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31391), 1, &gridStatus))
-    {
-        if (!isNaN_U16(gridStatus))
-        {
-            out.push_back(TP_FULL("grid_connection", "", gridStatus == 1 ? "Connected" : "Disconnected", 31391, "U16", 1.0f));
-        }
-    }
-
-    return true;
 }
 
-bool SolplanetASW::readGridEnergyAndLoad(std::vector<TelemetryPoint> &out)
+void SolplanetASW::parseGridConnection(const uint16_t *r, std::vector<TelemetryPoint> &out)
 {
-    // BULK READ OPTIMIZATION: Read 31630-31633 in one transaction (4 registers)
-    // Covers: E-Consumption-Today at AC side, E-Generation-Today at AC side
-    uint16_t acEnergyBulk[4];
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31630), 4, acEnergyBulk))
+    // 31391: Grid connection status
+    if (!isNaN_U16(r[0]))
     {
-        // Index 0-1: 31630-31631 - E-Consumption-Today at AC side (U32, kWh, scale 0.1)
-        uint32_t consumptionToday = ((uint32_t)acEnergyBulk[0] << 16) | acEnergyBulk[1];
-        if (!isNaN_U32(consumptionToday))
-        {
-            float energyKwh = consumptionToday * 0.1f;
-            out.push_back(TP_FULL("consumption_today", "kWh", String(energyKwh, 1), 31630, "U32", 0.1f));
-        }
-
-        // Index 2-3: 31632-31633 - E-Generation-Today at AC side (U32, kWh, scale 0.1)
-        uint32_t generationToday = ((uint32_t)acEnergyBulk[2] << 16) | acEnergyBulk[3];
-        if (!isNaN_U32(generationToday))
-        {
-            float energyKwh = generationToday * 0.1f;
-            out.push_back(TP_FULL("generation_today_ac", "kWh", String(energyKwh, 1), 31632, "U32", 0.1f));
-        }
+        out.push_back(TP_FULL("grid_connection", "", r[0] == 1 ? "Connected" : "Disconnected", 31391, "U16", 1.0f));
     }
-    else
-    {
-        ESPLogger::warn("Bulk read 31630-31633 (AC energy) failed");
-    }
-
-    // BULK READ OPTIMIZATION: Read 31634-31636 in one transaction (3 registers)
-    // Covers: EPS load basic measurements (voltage, current, frequency)
-    uint16_t epsBasicBulk[3];
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31634), 3, epsBasicBulk))
-    {
-        // Index 0: 31634 - EPS load voltage (U16, V, scale 0.1)
-        if (!isNaN_U16(epsBasicBulk[0]))
-        {
-            float voltage = epsBasicBulk[0] * 0.1f;
-            if (voltage > 10.0f)  // Only publish if backup is active
-            {
-                out.push_back(TP_FULL("eps_voltage", "V", String(voltage, 1), 31634, "U16", 0.1f));
-            }
-        }
-
-        // Index 1: 31635 - EPS load current (U16, A, scale 0.1)
-        if (!isNaN_U16(epsBasicBulk[1]))
-        {
-            float current = epsBasicBulk[1] * 0.1f;
-            out.push_back(TP_FULL("eps_current", "A", String(current, 1), 31635, "U16", 0.1f));
-        }
-
-        // Index 2: 31636 - EPS load frequency (U16, Hz, scale 0.01)
-        if (!isNaN_U16(epsBasicBulk[2]))
-        {
-            float freq = epsBasicBulk[2] * 0.01f;
-            if (freq > 10.0f)  // Only publish if backup is active
-            {
-                out.push_back(TP_FULL("eps_frequency", "Hz", String(freq, 2), 31636, "U16", 0.01f));
-            }
-        }
-    }
-    else
-    {
-        ESPLogger::debug("Bulk read 31634-31636 (EPS basic) failed - no backup output");
-    }
-
-    // BULK READ OPTIMIZATION: Read 31637-31644 in one transaction (8 registers)
-    // Covers: EPS load power and energy
-    uint16_t epsBulk[8];
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31637), 8, epsBulk))
-    {
-        // Index 0-1: 31637-31638 - EPS load active power (S32, W, scale 1.0)
-        int32_t epsActivePower = (int32_t)(((uint32_t)epsBulk[0] << 16) | epsBulk[1]);
-        if (!isNaN_S32(epsActivePower))
-        {
-            out.push_back(TP_FULL("eps_active_power", "W", String(epsActivePower), 31637, "S32", 1.0f));
-        }
-
-        // Index 2-3: 31639-31640 - EPS load reactive power (S32, Var, scale 1.0)
-        int32_t epsReactivePower = (int32_t)(((uint32_t)epsBulk[2] << 16) | epsBulk[3]);
-        if (!isNaN_S32(epsReactivePower))
-        {
-            out.push_back(TP_FULL("eps_reactive_power", "Var", String(epsReactivePower), 31639, "S32", 1.0f));
-        }
-
-        // Index 4-5: 31641-31642 - E-Consumption-Today at EPS load side (U32, kWh, scale 0.1)
-        uint32_t epsConsumptionToday = ((uint32_t)epsBulk[4] << 16) | epsBulk[5];
-        if (!isNaN_U32(epsConsumptionToday))
-        {
-            float energyKwh = epsConsumptionToday * 0.1f;
-            out.push_back(TP_FULL("eps_consumption_today", "kWh", String(energyKwh, 1), 31641, "U32", 0.1f));
-        }
-
-        // Index 6-7: 31643-31644 - E-Consumption-Total at EPS load side (U32, kWh, scale 0.1)
-        uint32_t epsConsumptionTotal = ((uint32_t)epsBulk[6] << 16) | epsBulk[7];
-        if (!isNaN_U32(epsConsumptionTotal))
-        {
-            float energyKwh = epsConsumptionTotal * 0.1f;
-            out.push_back(TP_FULL("eps_consumption_total", "kWh", String(energyKwh, 1), 31643, "U32", 0.1f));
-        }
-    }
-    else
-    {
-        ESPLogger::debug("Bulk read 31637-31644 (EPS power/energy) failed - no backup output");
-    }
-
-    // BULK READ OPTIMIZATION: Read 31645-31662 in one transaction (18 registers)
-    // Covers: EPS per-phase measurements (3-phase backup systems)
-    if (isThreePhase)
-    {
-        uint16_t epsPhaseBulk[18];
-        if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31645), 18, epsPhaseBulk))
-        {
-            // Index 0-5: 31645-31650 - Phase 1/2/3 voltage and current for EPS Load
-            if (!isNaN_U16(epsPhaseBulk[0]))
-            {
-                float voltage = epsPhaseBulk[0] * 0.1f;
-                if (voltage > 10.0f)
-                    out.push_back(TP_FULL("eps_l1_voltage", "V", String(voltage, 1), 31645, "U16", 0.1f));
-            }
-            if (!isNaN_U16(epsPhaseBulk[1]))
-            {
-                float current = epsPhaseBulk[1] * 0.1f;
-                out.push_back(TP_FULL("eps_l1_current", "A", String(current, 1), 31646, "U16", 0.1f));
-            }
-            if (!isNaN_U16(epsPhaseBulk[2]))
-            {
-                float voltage = epsPhaseBulk[2] * 0.1f;
-                if (voltage > 10.0f)
-                    out.push_back(TP_FULL("eps_l2_voltage", "V", String(voltage, 1), 31647, "U16", 0.1f));
-            }
-            if (!isNaN_U16(epsPhaseBulk[3]))
-            {
-                float current = epsPhaseBulk[3] * 0.1f;
-                out.push_back(TP_FULL("eps_l2_current", "A", String(current, 1), 31648, "U16", 0.1f));
-            }
-            if (!isNaN_U16(epsPhaseBulk[4]))
-            {
-                float voltage = epsPhaseBulk[4] * 0.1f;
-                if (voltage > 10.0f)
-                    out.push_back(TP_FULL("eps_l3_voltage", "V", String(voltage, 1), 31649, "U16", 0.1f));
-            }
-            if (!isNaN_U16(epsPhaseBulk[5]))
-            {
-                float current = epsPhaseBulk[5] * 0.1f;
-                out.push_back(TP_FULL("eps_l3_current", "A", String(current, 1), 31650, "U16", 0.1f));
-            }
-
-            // Index 6-17: 31651-31662 - Phase 1/2/3 active & reactive power for EPS Load
-            // Phase 1 active power
-            uint32_t epsL1Power = ((uint32_t)epsPhaseBulk[6] << 16) | epsPhaseBulk[7];
-            if (!isNaN_U32(epsL1Power))
-            {
-                out.push_back(TP_FULL("eps_l1_active_power", "W", String(epsL1Power), 31651, "U32", 1.0f));
-            }
-            // Phase 1 reactive power
-            int32_t epsL1Reactive = (int32_t)(((uint32_t)epsPhaseBulk[8] << 16) | epsPhaseBulk[9]);
-            if (!isNaN_S32(epsL1Reactive))
-            {
-                out.push_back(TP_FULL("eps_l1_reactive_power", "Var", String(epsL1Reactive), 31653, "S32", 1.0f));
-            }
-
-            // Phase 2 active power
-            uint32_t epsL2Power = ((uint32_t)epsPhaseBulk[10] << 16) | epsPhaseBulk[11];
-            if (!isNaN_U32(epsL2Power))
-            {
-                out.push_back(TP_FULL("eps_l2_active_power", "W", String(epsL2Power), 31655, "U32", 1.0f));
-            }
-            // Phase 2 reactive power
-            int32_t epsL2Reactive = (int32_t)(((uint32_t)epsPhaseBulk[12] << 16) | epsPhaseBulk[13]);
-            if (!isNaN_S32(epsL2Reactive))
-            {
-                out.push_back(TP_FULL("eps_l2_reactive_power", "Var", String(epsL2Reactive), 31657, "S32", 1.0f));
-            }
-
-            // Phase 3 active power
-            uint32_t epsL3Power = ((uint32_t)epsPhaseBulk[14] << 16) | epsPhaseBulk[15];
-            if (!isNaN_U32(epsL3Power))
-            {
-                out.push_back(TP_FULL("eps_l3_active_power", "W", String(epsL3Power), 31659, "U32", 1.0f));
-            }
-            // Phase 3 reactive power
-            int32_t epsL3Reactive = (int32_t)(((uint32_t)epsPhaseBulk[16] << 16) | epsPhaseBulk[17]);
-            if (!isNaN_S32(epsL3Reactive))
-            {
-                out.push_back(TP_FULL("eps_l3_reactive_power", "Var", String(epsL3Reactive), 31661, "S32", 1.0f));
-            }
-        }
-        else
-        {
-            ESPLogger::debug("Bulk read 31645-31662 (EPS per-phase) failed - no 3-phase backup");
-        }
-    }
-
-    // BULK READ OPTIMIZATION: Read 31663-31678 in one transaction (16 registers)
-    // Covers: Grid power per phase (3-phase) and grid export energy
-    uint16_t gridBulk[16];
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31663), 16, gridBulk))
-    {
-        if (isThreePhase)
-        {
-            // Index 0-1: 31663-31664 - Phase 1 active power for Grid (U32, W, scale 1.0)
-            uint32_t gridL1Power = ((uint32_t)gridBulk[0] << 16) | gridBulk[1];
-            if (!isNaN_U32(gridL1Power))
-            {
-                out.push_back(TP_FULL("grid_l1_power", "W", String(gridL1Power), 31663, "U32", 1.0f));
-            }
-
-            // Index 2-3: 31665-31666 - Phase 1 reactive power for Grid (S32, Var, scale 1.0)
-            int32_t gridL1Reactive = (int32_t)(((uint32_t)gridBulk[2] << 16) | gridBulk[3]);
-            if (!isNaN_S32(gridL1Reactive))
-            {
-                out.push_back(TP_FULL("grid_l1_reactive", "Var", String(gridL1Reactive), 31665, "S32", 1.0f));
-            }
-
-            // Index 4-5: 31667-31668 - Phase 2 active power for Grid (U32, W, scale 1.0)
-            uint32_t gridL2Power = ((uint32_t)gridBulk[4] << 16) | gridBulk[5];
-            if (!isNaN_U32(gridL2Power))
-            {
-                out.push_back(TP_FULL("grid_l2_power", "W", String(gridL2Power), 31667, "U32", 1.0f));
-            }
-
-            // Index 6-7: 31669-31670 - Phase 2 reactive power for Grid (S32, Var, scale 1.0)
-            int32_t gridL2Reactive = (int32_t)(((uint32_t)gridBulk[6] << 16) | gridBulk[7]);
-            if (!isNaN_S32(gridL2Reactive))
-            {
-                out.push_back(TP_FULL("grid_l2_reactive", "Var", String(gridL2Reactive), 31669, "S32", 1.0f));
-            }
-
-            // Index 8-9: 31671-31672 - Phase 3 active power for Grid (U32, W, scale 1.0)
-            uint32_t gridL3Power = ((uint32_t)gridBulk[8] << 16) | gridBulk[9];
-            if (!isNaN_U32(gridL3Power))
-            {
-                out.push_back(TP_FULL("grid_l3_power", "W", String(gridL3Power), 31671, "U32", 1.0f));
-            }
-
-            // Index 10-11: 31673-31674 - Phase 3 reactive power for Grid (S32, Var, scale 1.0)
-            int32_t gridL3Reactive = (int32_t)(((uint32_t)gridBulk[10] << 16) | gridBulk[11]);
-            if (!isNaN_S32(gridL3Reactive))
-            {
-                out.push_back(TP_FULL("grid_l3_reactive", "Var", String(gridL3Reactive), 31673, "S32", 1.0f));
-            }
-        }
-
-        // Index 12-13: 31675-31676 - Energy charge today for Grid (U32, kWh, scale 0.1)
-        uint32_t gridExportToday = ((uint32_t)gridBulk[12] << 16) | gridBulk[13];
-        if (!isNaN_U32(gridExportToday))
-        {
-            float energyKwh = gridExportToday * 0.1f;
-            out.push_back(TP_FULL("grid_export_today", "kWh", String(energyKwh, 1), 31675, "U32", 0.1f));
-        }
-
-        // Index 14-15: 31677-31678 - Energy charge total for Grid (U32, kWh, scale 0.1)
-        uint32_t gridExportTotal = ((uint32_t)gridBulk[14] << 16) | gridBulk[15];
-        if (!isNaN_U32(gridExportTotal))
-        {
-            float energyKwh = gridExportTotal * 0.1f;
-            out.push_back(TP_FULL("grid_export_total", "kWh", String(energyKwh, 1), 31677, "U32", 0.1f));
-        }
-    }
-    else
-    {
-        ESPLogger::warn("Bulk read 31663-31678 (grid power/energy) failed");
-    }
-
-    return true; // Non-fatal if some reads fail
 }
 
-bool SolplanetASW::readStorage(std::vector<TelemetryPoint> &out)
+void SolplanetASW::parsePVTotals(const uint16_t *r, std::vector<TelemetryPoint> &out)
 {
-    out.clear();
-
-    // Only read battery data if user enabled it in config
-    if (!config.getBool("read_storage_regs", false))
+    // 31601-31606: PV total power and PV-side energy (DC side, before inverter conversion)
+    // Index 0-1: 31601-31602 - PV total power (U32, W, scale 1.0)
+    uint32_t pvPower = ((uint32_t)r[0] << 16) | r[1];
+    if (!isNaN_U32(pvPower))
     {
-        return false;
+        out.push_back(TP_FULL("pv_total_power", "W", String(pvPower), 31601, "U32", 1.0f));
     }
 
-    // BULK READ OPTIMIZATION: Read 31607-31629 in one transaction (23 registers)
-    // Covers: BMS1 battery communication, status, voltage, current, power, temperature, SOC, SOH, charge/discharge energy
-    uint16_t batteryBulk[23];
-    if (!modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31607), 23, batteryBulk))
+    // Index 2-3: 31603-31604 - PV E-Today (U32, kWh, scale 0.1)
+    // This is DC-side energy before inverter losses
+    uint32_t pvEnergyToday = ((uint32_t)r[2] << 16) | r[3];
+    if (!isNaN_U32(pvEnergyToday))
     {
-        ESPLogger::error("Bulk read 31607-31629 (battery) failed");
-        return false;
+        float energyKwh = pvEnergyToday * 0.1f;
+        out.push_back(TP_FULL("pv_energy_today", "kWh", String(energyKwh, 1), 31603, "U32", 0.1f));
     }
 
+    // Index 4-5: 31605-31606 - PV E-Total (U32, kWh, scale 0.1)
+    // Total lifetime PV energy on DC side
+    uint32_t pvEnergyTotal = ((uint32_t)r[4] << 16) | r[5];
+    if (!isNaN_U32(pvEnergyTotal))
+    {
+        float energyKwh = pvEnergyTotal * 0.1f;
+        out.push_back(TP_FULL("pv_energy_total", "kWh", String(energyKwh, 1), 31605, "U32", 0.1f));
+    }
+}
+
+void SolplanetASW::parseBattery(const uint16_t *r, std::vector<TelemetryPoint> &out)
+{
+    // 31607-31629 (23 registers): BMS1 communication, status, voltage, current,
+    // power, temperature, SOC, SOH, limits, charge/discharge energy
     // Index 0: 31607 - BMS1 Battery communication status (E16)
     // 0x000A=Normal, 0x0005=Error
-    if (!isNaN_U16(batteryBulk[0]))
+    if (!isNaN_U16(r[0]))
     {
-        out.push_back(TP_FULL("battery_comm_status", "", String(batteryBulk[0], HEX), 31607, "E16", 1.0f));
+        out.push_back(TP_FULL("battery_comm_status", "", String(r[0], HEX), 31607, "E16", 1.0f));
     }
 
     // Index 1: 31608 - BMS1 Battery status (E16)
     // 0=N/A, 1=Idle, 2=Charging, 3=Discharging, 4=Error
-    if (!isNaN_U16(batteryBulk[1]))
+    if (!isNaN_U16(r[1]))
     {
-        uint16_t bmsStatus = batteryBulk[1];
+        uint16_t bmsStatus = r[1];
         out.push_back(TP_FULL("battery_status", "", String(bmsStatus), 31608, "E16", 1.0f));
         String statusText;
         switch (bmsStatus)
@@ -924,15 +1001,15 @@ bool SolplanetASW::readStorage(std::vector<TelemetryPoint> &out)
     // Index 2-9: 31609-31616 - Battery error/warning status registers (skip for now, detailed bit fields)
 
     // Index 10: 31617 - BMS1 Battery voltage (U16, V, scale 0.01)
-    if (!isNaN_U16(batteryBulk[10]))
+    if (!isNaN_U16(r[10]))
     {
-        float voltage = batteryBulk[10] * 0.01f;
+        float voltage = r[10] * 0.01f;
         out.push_back(TP_FULL("battery_voltage", "V", String(voltage, 2), 31617, "U16", 0.01f));
     }
 
     // Index 11: 31618 - BMS1 Battery current (S16, A, scale 0.1)
     // Positive = charging, Negative = discharging
-    int16_t currentSigned = (int16_t)batteryBulk[11];
+    int16_t currentSigned = (int16_t)r[11];
     if (!isNaN_S16(currentSigned))
     {
         float current = currentSigned * 0.1f;
@@ -940,14 +1017,14 @@ bool SolplanetASW::readStorage(std::vector<TelemetryPoint> &out)
     }
 
     // Index 12-13: 31619-31620 - BMS1 Battery power (S32, W, scale 1.0)
-    int32_t power = (int32_t)(((uint32_t)batteryBulk[12] << 16) | batteryBulk[13]);
+    int32_t power = (int32_t)(((uint32_t)r[12] << 16) | r[13]);
     if (!isNaN_S32(power))
     {
         out.push_back(TP_FULL("battery_power", "W", String(power), 31619, "S32", 1.0f));
     }
 
     // Index 14: 31621 - BMS1 Battery temperature (S16, °C, scale 0.1)
-    int16_t tempSigned = (int16_t)batteryBulk[14];
+    int16_t tempSigned = (int16_t)r[14];
     if (!isNaN_S16(tempSigned))
     {
         float temperature = tempSigned * 0.1f;
@@ -956,34 +1033,34 @@ bool SolplanetASW::readStorage(std::vector<TelemetryPoint> &out)
 
     // Index 15: 31622 - BMS1 Battery SOC (U16, %)
     // NOTE: Modbus doc says scale 0.01, but actual register returns 0-100 directly (not 0-10000)
-    if (!isNaN_U16(batteryBulk[15]))
+    if (!isNaN_U16(r[15]))
     {
-        out.push_back(TP_FULL("battery_soc", "%", String(batteryBulk[15]), 31622, "U16", 1.0f));
+        out.push_back(TP_FULL("battery_soc", "%", String(r[15]), 31622, "U16", 1.0f));
     }
 
     // Index 16: 31623 - BMS1 Battery SOH (U16, %)
     // Same issue as SOC - returns 0-100 directly
-    if (!isNaN_U16(batteryBulk[16]))
+    if (!isNaN_U16(r[16]))
     {
-        out.push_back(TP_FULL("battery_soh", "%", String(batteryBulk[16]), 31623, "U16", 1.0f));
+        out.push_back(TP_FULL("battery_soh", "%", String(r[16]), 31623, "U16", 1.0f));
     }
 
     // Index 17: 31624 - BMS1 Battery charging current limit (U16, A, scale 0.1)
-    if (!isNaN_U16(batteryBulk[17]))
+    if (!isNaN_U16(r[17]))
     {
-        float limit = batteryBulk[17] * 0.1f;
+        float limit = r[17] * 0.1f;
         out.push_back(TP_FULL("battery_charge_limit", "A", String(limit, 1), 31624, "U16", 0.1f));
     }
 
     // Index 18: 31625 - BMS1 Battery discharge current limit (U16, A, scale 0.1)
-    if (!isNaN_U16(batteryBulk[18]))
+    if (!isNaN_U16(r[18]))
     {
-        float limit = batteryBulk[18] * 0.1f;
+        float limit = r[18] * 0.1f;
         out.push_back(TP_FULL("battery_discharge_limit", "A", String(limit, 1), 31625, "U16", 0.1f));
     }
 
     // Index 19-20: 31626-31627 - BMS1 Battery E-Charge-Today (U32, kWh, scale 0.1)
-    uint32_t chargeToday = ((uint32_t)batteryBulk[19] << 16) | batteryBulk[20];
+    uint32_t chargeToday = ((uint32_t)r[19] << 16) | r[20];
     if (!isNaN_U32(chargeToday))
     {
         float energyKwh = chargeToday * 0.1f;
@@ -991,67 +1068,284 @@ bool SolplanetASW::readStorage(std::vector<TelemetryPoint> &out)
     }
 
     // Index 21-22: 31628-31629 - BMS1 Battery E-Discharge-Today (U32, kWh, scale 0.1)
-    uint32_t dischargeToday = ((uint32_t)batteryBulk[21] << 16) | batteryBulk[22];
+    uint32_t dischargeToday = ((uint32_t)r[21] << 16) | r[22];
     if (!isNaN_U32(dischargeToday))
     {
         float energyKwh = dischargeToday * 0.1f;
         out.push_back(TP_FULL("battery_discharge_today", "kWh", String(energyKwh, 1), 31628, "U32", 0.1f));
     }
+}
 
-    // BULK READ: BMS1 advanced diagnostics (31679-31681, 3 registers)
-    uint16_t bmsDiagBulk[3];
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31679), 3, bmsDiagBulk))
+void SolplanetASW::parseAcEnergy(const uint16_t *r, std::vector<TelemetryPoint> &out)
+{
+    // 31630-31633: consumption and generation today at the AC side
+    // Index 0-1: 31630-31631 - E-Consumption-Today at AC side (U32, kWh, scale 0.1)
+    uint32_t consumptionToday = ((uint32_t)r[0] << 16) | r[1];
+    if (!isNaN_U32(consumptionToday))
     {
-        // Index 0: 31679 - BMS1 Insulation resistance (U16, kΩ, scale 1.0)
-        if (!isNaN_U16(bmsDiagBulk[0]))
-        {
-            out.push_back(TP_FULL("battery_insulation_resistance", "kOhm", String(bmsDiagBulk[0]), 31679, "U16", 1.0f));
-        }
-
-        // Index 1: 31680 - BMS1 Charge/discharge cycles (U16, scale 1.0)
-        if (!isNaN_U16(bmsDiagBulk[1]))
-        {
-            out.push_back(TP_FULL("battery_cycles", "", String(bmsDiagBulk[1]), 31680, "U16", 1.0f));
-        }
-
-        // Index 2: 31681 - BMS1 Environment temperature (U16, °C, scale 0.1)
-        if (!isNaN_U16(bmsDiagBulk[2]))
-        {
-            float envTemp = bmsDiagBulk[2] * 0.1f;
-            out.push_back(TP_FULL("battery_env_temperature", "C", String(envTemp, 1), 31681, "U16", 0.1f));
-        }
-    }
-    else
-    {
-        ESPLogger::debug("Bulk read 31679-31681 (BMS diagnostics) failed - not critical");
+        float energyKwh = consumptionToday * 0.1f;
+        out.push_back(TP_FULL("consumption_today", "kWh", String(energyKwh, 1), 31630, "U32", 0.1f));
     }
 
-    // BULK READ: Diesel generator power (31685-31687, 3 registers)
-    uint16_t genBulk[3];
-    if (modbus.readInputRegisters(slaveAddr, inputRegisterToModbus(31685), 3, genBulk))
+    // Index 2-3: 31632-31633 - E-Generation-Today at AC side (U32, kWh, scale 0.1)
+    uint32_t generationToday = ((uint32_t)r[2] << 16) | r[3];
+    if (!isNaN_U32(generationToday))
     {
-        // Index 0-1: 31685-31686 - Oil engine power (S32, W, scale 1.0)
-        int32_t genPower = (int32_t)(((uint32_t)genBulk[0] << 16) | genBulk[1]);
-        if (!isNaN_S32(genPower))
-        {
-            out.push_back(TP_FULL("generator_power", "W", String(genPower), 31685, "S32", 1.0f));
-        }
+        float energyKwh = generationToday * 0.1f;
+        out.push_back(TP_FULL("generation_today_ac", "kWh", String(energyKwh, 1), 31632, "U32", 0.1f));
+    }
+}
 
-        // Index 2: 31687 - The power of the daily oil engine (U32, kWh, scale 0.1)
-        // Note: Register 31687 is a single U16, not U32 as documented - treating as U16 for now
-        if (!isNaN_U16(genBulk[2]))
+void SolplanetASW::parseEpsBasic(const uint16_t *r, std::vector<TelemetryPoint> &out)
+{
+    // 31634-31636: EPS (backup output) load voltage, current, frequency
+    // Index 0: 31634 - EPS load voltage (U16, V, scale 0.1)
+    if (!isNaN_U16(r[0]))
+    {
+        float voltage = r[0] * 0.1f;
+        if (voltage > 10.0f)  // Only publish if backup is active
         {
-            float genEnergyKwh = genBulk[2] * 0.1f;
-            out.push_back(TP_FULL("generator_energy_today", "kWh", String(genEnergyKwh, 1), 31687, "U16", 0.1f));
+            out.push_back(TP_FULL("eps_voltage", "V", String(voltage, 1), 31634, "U16", 0.1f));
         }
     }
-    else
+
+    // Index 1: 31635 - EPS load current (U16, A, scale 0.1)
+    if (!isNaN_U16(r[1]))
     {
-        ESPLogger::debug("Bulk read 31685-31687 (generator) failed - likely no gen-set connected");
+        float current = r[1] * 0.1f;
+        out.push_back(TP_FULL("eps_current", "A", String(current, 1), 31635, "U16", 0.1f));
     }
 
-    ESPLogger::info("Read %d battery telemetry points", out.size());
-    return !out.empty();
+    // Index 2: 31636 - EPS load frequency (U16, Hz, scale 0.01)
+    if (!isNaN_U16(r[2]))
+    {
+        float freq = r[2] * 0.01f;
+        if (freq > 10.0f)  // Only publish if backup is active
+        {
+            out.push_back(TP_FULL("eps_frequency", "Hz", String(freq, 2), 31636, "U16", 0.01f));
+        }
+    }
+}
+
+void SolplanetASW::parseEpsPower(const uint16_t *r, std::vector<TelemetryPoint> &out)
+{
+    // 31637-31644: EPS load power and energy
+    // Index 0-1: 31637-31638 - EPS load active power (S32, W, scale 1.0)
+    int32_t epsActivePower = (int32_t)(((uint32_t)r[0] << 16) | r[1]);
+    if (!isNaN_S32(epsActivePower))
+    {
+        out.push_back(TP_FULL("eps_active_power", "W", String(epsActivePower), 31637, "S32", 1.0f));
+    }
+
+    // Index 2-3: 31639-31640 - EPS load reactive power (S32, Var, scale 1.0)
+    int32_t epsReactivePower = (int32_t)(((uint32_t)r[2] << 16) | r[3]);
+    if (!isNaN_S32(epsReactivePower))
+    {
+        out.push_back(TP_FULL("eps_reactive_power", "Var", String(epsReactivePower), 31639, "S32", 1.0f));
+    }
+
+    // Index 4-5: 31641-31642 - E-Consumption-Today at EPS load side (U32, kWh, scale 0.1)
+    uint32_t epsConsumptionToday = ((uint32_t)r[4] << 16) | r[5];
+    if (!isNaN_U32(epsConsumptionToday))
+    {
+        float energyKwh = epsConsumptionToday * 0.1f;
+        out.push_back(TP_FULL("eps_consumption_today", "kWh", String(energyKwh, 1), 31641, "U32", 0.1f));
+    }
+
+    // Index 6-7: 31643-31644 - E-Consumption-Total at EPS load side (U32, kWh, scale 0.1)
+    uint32_t epsConsumptionTotal = ((uint32_t)r[6] << 16) | r[7];
+    if (!isNaN_U32(epsConsumptionTotal))
+    {
+        float energyKwh = epsConsumptionTotal * 0.1f;
+        out.push_back(TP_FULL("eps_consumption_total", "kWh", String(energyKwh, 1), 31643, "U32", 0.1f));
+    }
+}
+
+void SolplanetASW::parseEpsPhases(const uint16_t *r, std::vector<TelemetryPoint> &out)
+{
+    // 31645-31662 (18 registers): EPS per-phase measurements (3-phase backup systems)
+    // Index 0-5: 31645-31650 - Phase 1/2/3 voltage and current for EPS Load
+    if (!isNaN_U16(r[0]))
+    {
+        float voltage = r[0] * 0.1f;
+        if (voltage > 10.0f)
+            out.push_back(TP_FULL("eps_l1_voltage", "V", String(voltage, 1), 31645, "U16", 0.1f));
+    }
+    if (!isNaN_U16(r[1]))
+    {
+        float current = r[1] * 0.1f;
+        out.push_back(TP_FULL("eps_l1_current", "A", String(current, 1), 31646, "U16", 0.1f));
+    }
+    if (!isNaN_U16(r[2]))
+    {
+        float voltage = r[2] * 0.1f;
+        if (voltage > 10.0f)
+            out.push_back(TP_FULL("eps_l2_voltage", "V", String(voltage, 1), 31647, "U16", 0.1f));
+    }
+    if (!isNaN_U16(r[3]))
+    {
+        float current = r[3] * 0.1f;
+        out.push_back(TP_FULL("eps_l2_current", "A", String(current, 1), 31648, "U16", 0.1f));
+    }
+    if (!isNaN_U16(r[4]))
+    {
+        float voltage = r[4] * 0.1f;
+        if (voltage > 10.0f)
+            out.push_back(TP_FULL("eps_l3_voltage", "V", String(voltage, 1), 31649, "U16", 0.1f));
+    }
+    if (!isNaN_U16(r[5]))
+    {
+        float current = r[5] * 0.1f;
+        out.push_back(TP_FULL("eps_l3_current", "A", String(current, 1), 31650, "U16", 0.1f));
+    }
+
+    // Index 6-17: 31651-31662 - Phase 1/2/3 active & reactive power for EPS Load
+    // Phase 1 active power
+    uint32_t epsL1Power = ((uint32_t)r[6] << 16) | r[7];
+    if (!isNaN_U32(epsL1Power))
+    {
+        out.push_back(TP_FULL("eps_l1_active_power", "W", String(epsL1Power), 31651, "U32", 1.0f));
+    }
+    // Phase 1 reactive power
+    int32_t epsL1Reactive = (int32_t)(((uint32_t)r[8] << 16) | r[9]);
+    if (!isNaN_S32(epsL1Reactive))
+    {
+        out.push_back(TP_FULL("eps_l1_reactive_power", "Var", String(epsL1Reactive), 31653, "S32", 1.0f));
+    }
+
+    // Phase 2 active power
+    uint32_t epsL2Power = ((uint32_t)r[10] << 16) | r[11];
+    if (!isNaN_U32(epsL2Power))
+    {
+        out.push_back(TP_FULL("eps_l2_active_power", "W", String(epsL2Power), 31655, "U32", 1.0f));
+    }
+    // Phase 2 reactive power
+    int32_t epsL2Reactive = (int32_t)(((uint32_t)r[12] << 16) | r[13]);
+    if (!isNaN_S32(epsL2Reactive))
+    {
+        out.push_back(TP_FULL("eps_l2_reactive_power", "Var", String(epsL2Reactive), 31657, "S32", 1.0f));
+    }
+
+    // Phase 3 active power
+    uint32_t epsL3Power = ((uint32_t)r[14] << 16) | r[15];
+    if (!isNaN_U32(epsL3Power))
+    {
+        out.push_back(TP_FULL("eps_l3_active_power", "W", String(epsL3Power), 31659, "U32", 1.0f));
+    }
+    // Phase 3 reactive power
+    int32_t epsL3Reactive = (int32_t)(((uint32_t)r[16] << 16) | r[17]);
+    if (!isNaN_S32(epsL3Reactive))
+    {
+        out.push_back(TP_FULL("eps_l3_reactive_power", "Var", String(epsL3Reactive), 31661, "S32", 1.0f));
+    }
+}
+
+void SolplanetASW::parseGridPhasePower(const uint16_t *r, std::vector<TelemetryPoint> &out)
+{
+    // 31663-31674: grid active and reactive power per phase (3-phase only)
+    // Index 0-1: 31663-31664 - Phase 1 active power for Grid (U32, W, scale 1.0)
+    uint32_t gridL1Power = ((uint32_t)r[0] << 16) | r[1];
+    if (!isNaN_U32(gridL1Power))
+    {
+        out.push_back(TP_FULL("grid_l1_power", "W", String(gridL1Power), 31663, "U32", 1.0f));
+    }
+
+    // Index 2-3: 31665-31666 - Phase 1 reactive power for Grid (S32, Var, scale 1.0)
+    int32_t gridL1Reactive = (int32_t)(((uint32_t)r[2] << 16) | r[3]);
+    if (!isNaN_S32(gridL1Reactive))
+    {
+        out.push_back(TP_FULL("grid_l1_reactive", "Var", String(gridL1Reactive), 31665, "S32", 1.0f));
+    }
+
+    // Index 4-5: 31667-31668 - Phase 2 active power for Grid (U32, W, scale 1.0)
+    uint32_t gridL2Power = ((uint32_t)r[4] << 16) | r[5];
+    if (!isNaN_U32(gridL2Power))
+    {
+        out.push_back(TP_FULL("grid_l2_power", "W", String(gridL2Power), 31667, "U32", 1.0f));
+    }
+
+    // Index 6-7: 31669-31670 - Phase 2 reactive power for Grid (S32, Var, scale 1.0)
+    int32_t gridL2Reactive = (int32_t)(((uint32_t)r[6] << 16) | r[7]);
+    if (!isNaN_S32(gridL2Reactive))
+    {
+        out.push_back(TP_FULL("grid_l2_reactive", "Var", String(gridL2Reactive), 31669, "S32", 1.0f));
+    }
+
+    // Index 8-9: 31671-31672 - Phase 3 active power for Grid (U32, W, scale 1.0)
+    uint32_t gridL3Power = ((uint32_t)r[8] << 16) | r[9];
+    if (!isNaN_U32(gridL3Power))
+    {
+        out.push_back(TP_FULL("grid_l3_power", "W", String(gridL3Power), 31671, "U32", 1.0f));
+    }
+
+    // Index 10-11: 31673-31674 - Phase 3 reactive power for Grid (S32, Var, scale 1.0)
+    int32_t gridL3Reactive = (int32_t)(((uint32_t)r[10] << 16) | r[11]);
+    if (!isNaN_S32(gridL3Reactive))
+    {
+        out.push_back(TP_FULL("grid_l3_reactive", "Var", String(gridL3Reactive), 31673, "S32", 1.0f));
+    }
+}
+
+void SolplanetASW::parseGridExport(const uint16_t *r, std::vector<TelemetryPoint> &out)
+{
+    // 31675-31678: grid export energy today and total
+    // Index 0-1: 31675-31676 - Energy charge today for Grid (U32, kWh, scale 0.1)
+    uint32_t gridExportToday = ((uint32_t)r[0] << 16) | r[1];
+    if (!isNaN_U32(gridExportToday))
+    {
+        float energyKwh = gridExportToday * 0.1f;
+        out.push_back(TP_FULL("grid_export_today", "kWh", String(energyKwh, 1), 31675, "U32", 0.1f));
+    }
+
+    // Index 2-3: 31677-31678 - Energy charge total for Grid (U32, kWh, scale 0.1)
+    uint32_t gridExportTotal = ((uint32_t)r[2] << 16) | r[3];
+    if (!isNaN_U32(gridExportTotal))
+    {
+        float energyKwh = gridExportTotal * 0.1f;
+        out.push_back(TP_FULL("grid_export_total", "kWh", String(energyKwh, 1), 31677, "U32", 0.1f));
+    }
+}
+
+void SolplanetASW::parseBmsDiagnostics(const uint16_t *r, std::vector<TelemetryPoint> &out)
+{
+    // 31679-31681: BMS1 advanced diagnostics
+    // Index 0: 31679 - BMS1 Insulation resistance (U16, kΩ, scale 1.0)
+    if (!isNaN_U16(r[0]))
+    {
+        out.push_back(TP_FULL("battery_insulation_resistance", "kOhm", String(r[0]), 31679, "U16", 1.0f));
+    }
+
+    // Index 1: 31680 - BMS1 Charge/discharge cycles (U16, scale 1.0)
+    if (!isNaN_U16(r[1]))
+    {
+        out.push_back(TP_FULL("battery_cycles", "", String(r[1]), 31680, "U16", 1.0f));
+    }
+
+    // Index 2: 31681 - BMS1 Environment temperature (U16, °C, scale 0.1)
+    if (!isNaN_U16(r[2]))
+    {
+        float envTemp = r[2] * 0.1f;
+        out.push_back(TP_FULL("battery_env_temperature", "C", String(envTemp, 1), 31681, "U16", 0.1f));
+    }
+}
+
+void SolplanetASW::parseGenerator(const uint16_t *r, std::vector<TelemetryPoint> &out)
+{
+    // 31685-31687: diesel generator power and energy
+    // Index 0-1: 31685-31686 - Oil engine power (S32, W, scale 1.0)
+    int32_t genPower = (int32_t)(((uint32_t)r[0] << 16) | r[1]);
+    if (!isNaN_S32(genPower))
+    {
+        out.push_back(TP_FULL("generator_power", "W", String(genPower), 31685, "S32", 1.0f));
+    }
+
+    // Index 2: 31687 - The power of the daily oil engine (U32, kWh, scale 0.1)
+    // Note: Register 31687 is a single U16, not U32 as documented - treating as U16 for now
+    if (!isNaN_U16(r[2]))
+    {
+        float genEnergyKwh = r[2] * 0.1f;
+        out.push_back(TP_FULL("generator_energy_today", "kWh", String(genEnergyKwh, 1), 31687, "U16", 0.1f));
+    }
 }
 
 String SolplanetASW::getErrorDescription(uint16_t errorCode) const

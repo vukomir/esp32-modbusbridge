@@ -446,6 +446,30 @@ bool GenericModbusDevice::parseBits(JsonArrayConst arr, std::vector<BitField> &o
     return true;
 }
 
+bool GenericModbusDevice::parseInterval(JsonObjectConst obj, const String &what, PollSchedule &out, String &errorOut)
+{
+    out = PollSchedule();
+
+    JsonVariantConst v = obj["interval_sec"];
+    if (v.isNull())
+    {
+        return true; // absent: read on every poll cycle
+    }
+    if (!v.is<int>())
+    {
+        errorOut = what + ": interval_sec must be a whole number of seconds";
+        return false;
+    }
+    long sec = v.as<long>();
+    if (sec < 1 || sec > (long)MAX_INTERVAL_SEC)
+    {
+        errorOut = what + ": interval_sec must be 1.." + String((unsigned long)MAX_INTERVAL_SEC);
+        return false;
+    }
+    out.intervalMs = (uint32_t)sec * 1000u;
+    return true;
+}
+
 bool GenericModbusDevice::parseRegisterDef(JsonObjectConst obj, int schemaVer, RegisterDef &out, String &errorOut)
 {
     JsonVariantConst addrV = obj["addr"];
@@ -474,6 +498,14 @@ bool GenericModbusDevice::parseRegisterDef(JsonObjectConst obj, int schemaVer, R
     }
 
     out.isStorage = obj["storage"] | false;
+
+    {
+        const char *n = obj["name"] | "?";
+        if (!parseInterval(obj, String("register '") + n + "'", out.schedule, errorOut))
+        {
+            return false;
+        }
+    }
 
     // `offset` is meaningful only inside a group. On a flat register it would be
     // silently discarded; reject so users notice the schema mismatch.
@@ -534,6 +566,11 @@ bool GenericModbusDevice::parseGroup(JsonObjectConst obj, int schemaVer, Registe
     }
 
     out.isStorage = obj["storage"] | false;
+
+    if (!parseInterval(obj, "group '" + out.name + "'", out.schedule, errorOut))
+    {
+        return false;
+    }
 
     JsonArrayConst fieldsArr = obj["fields"].as<JsonArrayConst>();
     if (fieldsArr.isNull() || fieldsArr.size() == 0)
@@ -784,6 +821,7 @@ bool GenericModbusDevice::readPhase(bool storagePhase, std::vector<TelemetryPoin
 {
     int flatOk = 0, flatFail = 0, flatBudgetSkip = 0;
     int groupOk = 0, groupFail = 0, groupBudgetSkip = 0;
+    int dueCount = 0;
 
     const uint32_t startMs = millis();
     const uint32_t budget = pollBudgetMs();
@@ -801,19 +839,34 @@ bool GenericModbusDevice::readPhase(bool storagePhase, std::vector<TelemetryPoin
         return false;
     };
 
-    for (const auto &reg : registers)
+    // Entries with an interval_sec are skipped until they are due. One that
+    // fails, or is squeezed out by the budget, stays due and is tried again on
+    // the next cycle rather than waiting out its whole interval.
+    for (auto &reg : registers)
     {
         if (reg.isStorage != storagePhase) continue;
+        if (!reg.schedule.due(startMs)) continue;
+        dueCount++;
         if (budgetExpired()) { flatBudgetSkip++; continue; }
-        if (readFlatRegister(reg, out)) flatOk++;
+        if (readFlatRegister(reg, out))
+        {
+            flatOk++;
+            reg.schedule.markRead(startMs);
+        }
         else flatFail++;
     }
 
-    for (const auto &grp : groups)
+    for (auto &grp : groups)
     {
         if (grp.isStorage != storagePhase) continue;
+        if (!grp.schedule.due(startMs)) continue;
+        dueCount++;
         if (budgetExpired()) { groupBudgetSkip++; continue; }
-        if (readGroup(grp, out)) groupOk++;
+        if (readGroup(grp, out))
+        {
+            groupOk++;
+            grp.schedule.markRead(startMs);
+        }
         else groupFail++;
     }
 
@@ -826,7 +879,9 @@ bool GenericModbusDevice::readPhase(bool storagePhase, std::vector<TelemetryPoin
     }
 
     // Per-group / per-flat isolation: anything successfully read is published.
-    return (flatOk + groupOk) > 0;
+    // A cycle where nothing was due is not a failure - it only means every
+    // entry of this phase has an interval_sec and none had come round yet.
+    return (flatOk + groupOk) > 0 || dueCount == 0;
 }
 
 bool GenericModbusDevice::readBasic(std::vector<TelemetryPoint> &out)

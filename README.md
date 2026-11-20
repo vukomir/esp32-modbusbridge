@@ -34,7 +34,8 @@ A comprehensive ESP32-based monitoring system for solar inverters and smart mete
 - **Live Web Console**: Real-time log streaming with WebSocket.
 - **Log Level Control**: Dynamic log verbosity adjustment.
 - **System Status**: Memory usage, uptime, connection status.
-- **Per-poll retry with exponential backoff**: transient bus errors (CRC mismatch, timeout, partial frame) are retried 3× with 100/200/400 ms backoff before failing the poll.
+- **Per-read retry**: transient bus errors (CRC mismatch, timeout, partial frame) are retried up to 3× before failing the read — immediately after a timeout, after 20/40 ms when a corrupt frame was received. A Modbus exception reply is not retried: the device answered, and would give the same answer again.
+- **Tiered polling (SolPlanet ASW)**: live values are read every poll cycle, slower-moving ones less often, and neighbouring register blocks share one Modbus transaction. See [Polling tiers](#polling-tiers).
 - **Device-availability MQTT topic**: after several consecutive failed polls the device publishes `offline` to its availability topic so Home Assistant can mark sensors unavailable instead of showing stale retained values.
 - **Downloadable boot log**: `GET /api/logs/download` returns a plain-text log kept in RTC memory, so a boot that fails can be diagnosed after the fact without a serial cable. See below.
 
@@ -159,8 +160,34 @@ Once configured and connected to your WiFi:
 
 ### **Device Configuration**
 - **Device Model**: Select your inverter/meter model
-- **Poll Interval**: Data collection frequency (seconds)
+- **Poll Interval**: Data collection frequency (seconds). This is the period between poll starts, so `1` means one reading per second. For the SolPlanet ASW it is the rate of the *live* values; see below.
+- **Medium Interval** / **Slow Interval**: how often tiered drivers read slower-moving values (defaults `10` and `30` seconds).
 - **Read Storage Registers**: Enable battery/storage monitoring
+
+#### Polling tiers
+
+Reading the whole SolPlanet register map takes well over a second at 9600 baud, so it cannot all be read every second. The driver instead splits the map into tiers:
+
+| Tier | Period | Values |
+|---|---|---|
+| Fast | Poll Interval | PV voltage/current/power, string currents, phase voltages and currents, grid frequency, active/apparent/reactive power, power factor, per-phase grid power, EPS (backup output) load, fault / error / warning codes |
+| Medium | Medium Interval (10 s) | Battery (status, voltage, current, power, temperature, SOC, SOH, limits, charge/discharge today), device state, connect time, temperatures, bus voltage, grid connection |
+| Slow | Slow Interval (30 s) | Energy counters (today/total, consumption, generation, grid export), operating hours, generator |
+| Slower | 2 × Slow Interval | BMS diagnostics (insulation resistance, cycles, environment temperature) |
+| Static | 10 × Slow Interval | Rated voltage/frequency, Modbus address, grid code |
+
+Notes:
+
+- Everything is read once on the first cycle after boot, so Home Assistant has the full picture straight away.
+- Register blocks that are due in the same cycle and are neighbours on the register map are fetched in **one** Modbus transaction. A steady-state cycle on a 3-phase hybrid is 3 transactions (`31319–31379`, `31601–31606`, `31634–31674`).
+- `pv_energy_today`, `pv_energy_total`, `eps_consumption_today` and `eps_consumption_total` sit inside fast blocks and therefore update at the fast rate.
+- Slower blocks are fitted into what is left of the cycle; one that does not fit is read on the next cycle. The fast tier is never displaced.
+- A block the inverter answers with a Modbus exception (for example the EPS registers on a model without backup output) is skipped and probed again every 10 minutes.
+- If long reads keep failing on a noisy bus while short reads succeed, the driver halves its maximum read size by itself (64 → 32 → 24 registers).
+- MQTT topics and metric names are unchanged. A value that is not read in a cycle is not re-published in that cycle; its retained value stays.
+- A change to any of the three intervals takes effect after a restart.
+
+Custom JSON devices get the same ability through a per-group `interval_sec` — see [docs/CUSTOM_DEVICES.md](docs/CUSTOM_DEVICES.md).
 
 ## 🛡️ Safety Guarantees
 

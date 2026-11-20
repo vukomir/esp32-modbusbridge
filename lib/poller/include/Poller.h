@@ -51,6 +51,26 @@ private:
     AvailabilityState publishedAvailability;
     static constexpr unsigned long MAX_CONSECUTIVE_FAILURES = 3;
 
+    // Status topics are published when they change, plus a periodic refresh
+    // for the poll counters. Publishing all three on every cycle was fine at a
+    // 10s interval; at 1s it is three retained messages a second that say
+    // nothing new.
+    static constexpr unsigned long STATUS_REFRESH_MS = 30000;
+    enum class PollStatusState { Unknown, Ok, Failed };
+    PollStatusState publishedPollStatus;
+    unsigned long lastPollStatusPublishMs;
+
+    // One per hardware status topic: the RS485 transceiver and the device
+    // behind it.
+    struct HardwareStatusSlot
+    {
+        String published;             // last status that reached the broker
+        String logged;                // last status written to the log
+        unsigned long publishedMs = 0;
+    };
+    HardwareStatusSlot max485StatusSlot;
+    HardwareStatusSlot deviceStatusSlot;
+
     // Polling logic
     bool initializeInverter();
     bool readAndPublishTelemetry();

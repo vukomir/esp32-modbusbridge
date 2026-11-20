@@ -94,7 +94,8 @@ At least one of `registers` or `groups` must be non-empty.
 | `type` | yes | `"uint16"`, `"int16"`, `"uint32"`, or `"int32"` |
 | `scale` | yes | Multiplier applied to raw value |
 | `unit` | yes | `"V"`, `"A"`, `"W"`, `"kWh"`, `"%"`, `""`, etc. |
-| `storage` | no | `true` = read by `readStorage()` (less frequent battery poll). Default `false`. |
+| `storage` | no | `true` = read by `readStorage()` (only when "Read Battery/Storage Registers" is enabled). Default `false`. |
+| `interval_sec` | no | Read this register every N seconds instead of on every poll cycle. `1..86400`. See [Per-entry polling interval](#per-entry-polling-interval-interval_sec). |
 | `nan_value` | no, schema 2 | Raw value treated as "no data" — suppress publish when matched. Hex string or integer. |
 | `bits` | no, schema 2, `uint16` only | See bitfield decoding below. |
 | `comment` | no | Documentation only |
@@ -108,6 +109,7 @@ At least one of `registers` or `groups` must be non-empty.
 | `start` | yes | Address of word 0 of the block |
 | `count` | yes | Number of 16-bit words to read in one transaction. **Range 1..125.** |
 | `storage` | no | Whole-group flag. Default `false`. |
+| `interval_sec` | no | Read this group every N seconds instead of on every poll cycle. `1..86400`. |
 | `fields` | yes | Non-empty array of `Field` definitions (see below) |
 
 ### Field within a group (`groups[*].fields[*]`)
@@ -152,11 +154,31 @@ Accepted forms:
 - **JSON integer**: `"nan_value": 65535`, `"nan_value": 4294967295`, or `"nan_value": -1` for signed types.
 - Malformed strings (e.g. `"foobar"`), wrong types (boolean, null, object), and presence on schema-1 docs are all rejected at validation time with a clear error.
 
+## Per-entry polling interval (`interval_sec`)
+
+By default every register and group is read on every poll cycle, at the global **Poll Interval**. Add `interval_sec` to a flat register or a group to read it less often:
+
+```json
+{ "name": "live_block",   "fc": 4, "start": "0x0000", "count": 18, "fields": [ ... ] },
+{ "name": "energy_block", "fc": 4, "start": "0x0040", "count": 8,  "interval_sec": 30,  "fields": [ ... ] },
+{ "name": "nameplate",    "fc": 4, "start": "0x0100", "count": 4,  "interval_sec": 300, "fields": [ ... ] }
+```
+
+This is what makes a short poll interval affordable. With the poll interval at 1 second, `live_block` is read every second while the energy counters cost one transaction every 30 seconds instead of every second.
+
+- Entries **without** `interval_sec` are read every cycle.
+- Everything is read on the **first cycle after boot**, whatever its interval.
+- An entry is never read more often than the poll interval, so `interval_sec` smaller than the poll interval behaves like no interval at all.
+- If a read **fails**, or is skipped by the per-poll time budget, the entry stays due and is tried again on the next cycle rather than waiting out its whole interval.
+- A field that is not read in a cycle is simply not published in that cycle. Its retained MQTT value stays as it was.
+- `interval_sec` is a property of the **transaction**: it goes on a flat register or on a group, not on an individual field inside a group.
+- It is accepted at any `schema_version`. Older firmware ignores it and reads the entry every cycle.
+
 ## Failure semantics
 
 **Per-flat-register failure** is independent: a single failed flat register is silently skipped, others publish. (Unchanged from schema 1.)
 
-**Per-group failure** is all-or-nothing **for that one group**: if the group's Modbus transaction fails (after the client's 3-attempt retry), all of its fields are skipped this cycle. **Other groups and flat registers in the same poll still publish normally.** A failure log line is emitted per failed group.
+**Per-group failure** is all-or-nothing **for that one group**: if the group's Modbus transaction fails (after the client's retries — up to 3 attempts for timeouts and corrupt frames, none for a Modbus exception reply), all of its fields are skipped this cycle. **Other groups and flat registers in the same poll still publish normally.** A failure log line is emitted per failed group.
 
 If you put 20 registers in a group and one of them is forbidden by the device, the group's read returns Modbus exception 0x02 and the entire group is dropped that cycle. **Always verify each register address with the diagnostics page (Manual Register Probe) before bundling them into a group.** When debugging a group that fails persistently, split it in half until you find the offending register.
 

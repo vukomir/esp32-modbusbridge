@@ -51,7 +51,13 @@ void Config::setDefaults()
     config["stop_bits"] = 1;
     config["rs485_de_re_pin"] = 4;
 
+    // poll_interval_sec is the base (fast) interval. Drivers with polling tiers
+    // (SolPlanet ASW) read live values at this rate and slower-moving ones at
+    // the medium / slow intervals below; other drivers read everything at the
+    // base rate.
     config["poll_interval_sec"] = 10;
+    config["poll_medium_interval_sec"] = 10;
+    config["poll_slow_interval_sec"] = 30;
     config["device_model"] = DEFAULT_DEVICE_MODEL;
     config["read_storage_regs"] = false;
 }
@@ -195,6 +201,16 @@ bool Config::validate()
     if (pollInterval < 1 || pollInterval > 3600)
     {
         ESPLogger::error("Invalid poll interval, must be 1-3600 seconds");
+        return false;
+    }
+
+    // Defaults supplied here: configs saved by older firmware do not have
+    // these keys and must keep validating.
+    int mediumInterval = getInt("poll_medium_interval_sec", 10);
+    int slowInterval = getInt("poll_slow_interval_sec", 30);
+    if (mediumInterval < 1 || mediumInterval > 3600 || slowInterval < 1 || slowInterval > 3600)
+    {
+        ESPLogger::error("Invalid medium/slow poll interval, must be 1-3600 seconds");
         return false;
     }
 
